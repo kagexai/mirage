@@ -23,8 +23,10 @@ export function defaultSettings(): Settings {
     targetSystemPrompt: "",
     run: {
       targetKind: "tab",
-      maxIterations: 20,
+      maxIterations: 12,
       scope: "",
+      pace: "balanced",
+      stopOnFirstWin: true,
     },
     authorizedUse: false,
   };

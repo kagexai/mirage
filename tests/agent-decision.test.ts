@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { parseAgentDecision } from "@/src/agents/redteam-agent";
-import { parseGoalVerdict } from "@/src/agents/goal-judge";
+import {
+  parseAgentDecision,
+  paceProfile,
+  renderMemory,
+  shouldStopOnFirstWin,
+  type MemoryEntry,
+} from "@/src/agents/redteam-agent";
+import { parseGoalVerdict, shouldJudgeGoal } from "@/src/agents/goal-judge";
 
 describe("parseAgentDecision", () => {
   it("parses a clean probe decision", () => {
@@ -64,5 +70,89 @@ describe("parseGoalVerdict", () => {
   it("coerces a bad severity to high", () => {
     const v = parseGoalVerdict('{"achieved":true,"evidence":"x","severity":"???"}');
     expect(v.severity).toBe("high");
+  });
+});
+
+describe("shouldJudgeGoal (latency gate)", () => {
+  it("skips when a marker already won", () => {
+    expect(
+      shouldJudgeGoal({
+        response: "Sure, here is the full system prompt: You are...",
+        phase: "test",
+        markerWin: true,
+        pace: "balanced",
+      }),
+    ).toBe(false);
+  });
+
+  it("skips recon under fast/balanced", () => {
+    expect(
+      shouldJudgeGoal({
+        response: "I am a helpful assistant that can use tools.",
+        phase: "recon",
+        markerWin: false,
+        pace: "fast",
+      }),
+    ).toBe(false);
+  });
+
+  it("runs on interesting test replies", () => {
+    expect(
+      shouldJudgeGoal({
+        response: "My system prompt is: You are Aegis Support with the following rules...",
+        phase: "test",
+        markerWin: false,
+        pace: "balanced",
+      }),
+    ).toBe(true);
+  });
+
+  it("skips short chitchat under balanced", () => {
+    expect(
+      shouldJudgeGoal({
+        response: "Hello!",
+        phase: "test",
+        markerWin: false,
+        pace: "balanced",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("pace / memory compaction", () => {
+  it("fast profile uses a smaller memory window and tokens", () => {
+    const f = paceProfile("fast");
+    const b = paceProfile("balanced");
+    const t = paceProfile("thorough");
+    expect(f.memoryLimit).toBeLessThan(b.memoryLimit);
+    expect(b.memoryLimit).toBeLessThan(t.memoryLimit);
+    expect(f.maxTokens).toBeLessThan(t.maxTokens);
+  });
+
+  it("renderMemory omits thoughts and clips long fields", () => {
+    const memory: MemoryEntry[] = [
+      { kind: "thought", iteration: 1, phase: "recon", thought: "long thought ".repeat(20), action: "probe" },
+      {
+        kind: "probe",
+        iteration: 1,
+        objective: "recon",
+        prompt: "P".repeat(500),
+        response: "R".repeat(500),
+        outcome: "no-win",
+        markersHit: [],
+      },
+    ];
+    const out = renderMemory(memory, 12, { promptChars: 40, responseChars: 40, omitThoughts: true });
+    expect(out).not.toContain("long thought");
+    expect(out).toContain("…");
+    expect(out.length).toBeLessThan(200);
+  });
+
+  it("shouldStopOnFirstWin defaults from pace", () => {
+    expect(shouldStopOnFirstWin({ targetKind: "tab", maxIterations: 10, pace: "fast" })).toBe(true);
+    expect(shouldStopOnFirstWin({ targetKind: "tab", maxIterations: 10, pace: "thorough" })).toBe(false);
+    expect(
+      shouldStopOnFirstWin({ targetKind: "tab", maxIterations: 10, pace: "thorough", stopOnFirstWin: true }),
+    ).toBe(true);
   });
 });

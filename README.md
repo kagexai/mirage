@@ -34,13 +34,20 @@ npm test         # vitest
 
 Load unpacked: `chrome://extensions` → Developer mode → **Load unpacked** → `.output/chrome-mv3`.
 
+After rebuild, **Reload** the extension and accept any new site-access permission
+prompt — Mirage needs host access to inject into the tab under test (any http/https site).
+
 ## Use
 
 1. Open the side panel and accept the authorized-use notice.
-2. Set your attacker/judge model and API key in **Settings**. A fast model (grok-4-fast,
-   gpt-4o-mini, claude-haiku) makes runs noticeably quicker.
-3. Pick a target (active tab or API endpoint) and an objective.
-4. **Launch.** Watch the agent reason in real time; export a report.
+2. Set your attacker/judge model and API key in **Settings**. Defaults are fast models
+   (grok-4-fast, gpt-4o-mini, claude-haiku); flagship models are slower but smarter.
+3. Focus the tab that has the AI chat UI (normal `http`/`https` page — not `chrome://`).
+4. Pick target **Active tab** (or API), a **pace**, and an objective.
+5. **Launch.** Watch the agent reason in real time; export a report.
+
+If you see `no host permission for …`, reload Mirage on `chrome://extensions` so the
+updated host permissions take effect.
 
 API keys are stored in `chrome.storage.local` and never written into reports.
 

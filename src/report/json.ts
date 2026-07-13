@@ -5,6 +5,7 @@ export interface ReportSummary {
   wins: number;
   partials: number;
   errors: number;
+  probes: number;
   bySeverity: Record<string, number>;
   byCategory: Record<string, number>;
 }
@@ -23,7 +24,15 @@ export function summarise(state: RunState): ReportSummary {
     } else if (f.verdict === "partial") partials++;
     else if (f.verdict === "error") errors++;
   }
-  return { total: state.findings.length, wins, partials, errors, bySeverity, byCategory };
+  return {
+    total: state.findings.length,
+    wins,
+    partials,
+    errors,
+    probes: state.transcript?.length ?? 0,
+    bySeverity,
+    byCategory,
+  };
 }
 
 export function toJsonReport(state: RunState): string {
@@ -39,9 +48,33 @@ export function toJsonReport(state: RunState): string {
         startedAt: state.startedAt,
         finishedAt: state.finishedAt,
         iterations: state.completed,
+        error: state.error,
       },
       summary: summarise(state),
-      findings: state.findings,
+      // Full attack/response log — every probe, not only confirmed wins.
+      transcript: (state.transcript ?? []).map((p) => ({
+        iteration: p.iteration,
+        phase: p.phase,
+        thought: p.thought,
+        objective: p.objective,
+        category: p.category,
+        outcome: p.outcome,
+        markersHit: p.markersHit,
+        elapsedMs: p.elapsedMs,
+        input: p.prompt,
+        output: p.response,
+        sideEffects: p.sideEffects,
+      })),
+      findings: state.findings.map((f) => ({
+        ...f,
+        steps: f.steps.map((s) => ({
+          iteration: s.iteration,
+          objective: s.objective,
+          input: s.prompt,
+          output: s.response,
+          sideEffects: s.sideEffects,
+        })),
+      })),
     },
     null,
     2,

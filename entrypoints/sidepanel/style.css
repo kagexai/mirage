@@ -262,6 +262,18 @@ button:disabled {
   color: var(--teal);
   border-color: var(--teal);
 }
+.io-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-top: 8px;
+}
+.finding .think {
+  font-style: italic;
+  color: var(--muted);
+}
 .finding .name {
   font-weight: 600;
   font-size: 12px;
@@ -280,8 +292,9 @@ details pre {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 6px;
-  max-height: 160px;
+  max-height: 220px;
   overflow: auto;
+  margin: 4px 0 8px;
 }
 .disclaimer {
   color: var(--muted);

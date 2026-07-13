@@ -14,6 +14,22 @@ export interface StepResult {
   sideEffects?: string[];
 }
 
+// Full probe log entry — every attack/response pair, not just wins.
+// Reports and the live feed use this so operators always see I/O.
+export interface ProbeLog {
+  iteration: number;
+  phase: AgentPhase;
+  thought: string;
+  objective: string;
+  category?: string;
+  prompt: string;
+  response: string;
+  outcome: "CONFIRMED-WIN" | "no-win" | "refused" | "error";
+  markersHit: string[];
+  sideEffects?: string[];
+  elapsedMs?: number;
+}
+
 export type Verdict = "win" | "partial" | "no-win" | "error";
 
 // A finding the agent surfaced. "win" = deterministically confirmed (a real
@@ -38,12 +54,22 @@ export interface Finding {
 
 export type RunStatus = "idle" | "running" | "done" | "stopped" | "error";
 
+// How aggressively to trade LLM cost/latency for coverage.
+//   fast     — compact context, skip most goal-judge calls, stop on first win
+//   balanced — default: smart judge gating + stop on first confirmed win
+//   thorough — full memory, judge every non-refusal probe, keep hunting after wins
+export type RunPace = "fast" | "balanced" | "thorough";
+
 export interface RunConfig {
   targetKind: "tab" | "api";
   // Iteration budget for the agent loop.
   maxIterations: number;
   // Optional operator scope/objective hint the agent focuses on.
   scope?: string;
+  // Latency/cost profile (default: balanced).
+  pace?: RunPace;
+  // Stop the run after the first confirmed (marker) win. Defaults from pace when unset.
+  stopOnFirstWin?: boolean;
 }
 
 export interface RunState {
@@ -53,6 +79,8 @@ export interface RunState {
   startedAt: number;
   finishedAt?: number;
   findings: Finding[];
+  // Every probe prompt/response (wins and misses). Source of truth for reports.
+  transcript: ProbeLog[];
   // Progress counters for the UI (total = maxIterations).
   total: number;
   completed: number;
@@ -60,11 +88,12 @@ export interface RunState {
   error?: string;
 }
 
-// Events streamed from the service-worker engine to the side panel.
+// Events streamed from the engine to the side panel (or local emitter).
 export type EngineEvent =
   | { type: "run:start"; state: RunState }
   | { type: "run:progress"; completed: number; total: number; wins: number }
   | { type: "agent"; iteration: number; phase: AgentPhase; thought: string }
+  | { type: "probe"; probe: ProbeLog }
   | { type: "finding"; finding: Finding }
   | { type: "log"; level: "info" | "warn" | "error"; message: string }
   | { type: "run:done"; state: RunState }
