@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/mirage-banner.png" alt="Mirage — an AI red-team agent that runs in your browser" width="100%" />
+</p>
+
 # Mirage
 
 An AI red-team agent that runs in your browser. Point it at any AI — a chat widget, an
