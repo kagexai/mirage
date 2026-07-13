@@ -54,3 +54,7 @@ loop), `src/agents/` (red-team agent, goal judge), `src/scoring/` (deterministic
 
 Mirage sends adversarial prompts to whatever you point it at. Only run it against systems you
 own or are explicitly authorized to test.
+
+## License
+
+MIT — see [LICENSE](./LICENSE).
