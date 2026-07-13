@@ -7,8 +7,10 @@ import {
 } from "@/src/settings";
 import { DEFAULT_MODELS, PROVIDER_IDS, type ProviderId } from "@/src/providers/types";
 import { createProvider } from "@/src/providers";
-import { PORT_NAME, type PanelMessage } from "@/src/messaging";
-import type { AgentPhase, EngineEvent, Finding, RunState } from "@/src/engine/run";
+import { runAgent } from "@/src/engine/agent";
+import { createApiTarget } from "@/src/targets/api";
+import { createTabTarget } from "@/src/targets/tab";
+import type { AgentPhase, EngineEvent, Finding, ProbeLog, RunState } from "@/src/engine/run";
 import { toJsonReport } from "@/src/report/json";
 import { toHtmlReport } from "@/src/report/html";
 import { generateNarrativeReport, narrativeToHtml } from "@/src/report/narrative";
@@ -18,6 +20,7 @@ type Status = "idle" | "running" | "done" | "stopped" | "error";
 type View = "run" | "settings";
 type FeedItem =
   | { kind: "agent"; iteration: number; phase: AgentPhase; thought: string }
+  | { kind: "probe"; probe: ProbeLog }
   | { kind: "finding"; finding: Finding };
 
 const PRODUCTS = [
@@ -50,6 +53,7 @@ export function App() {
   const [status, setStatus] = useState<Status>("idle");
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [findings, setFindings] = useState<Finding[]>([]);
+  const [transcript, setTranscript] = useState<ProbeLog[]>([]);
   const [progress, setProgress] = useState({ completed: 0, total: 0, wins: 0 });
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<{ open: boolean; loading: boolean; md: string; error: string | null }>({
@@ -58,8 +62,9 @@ export function App() {
     md: "",
     error: null,
   });
-  const portRef = useRef<chrome.runtime.Port | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
   const startedAtRef = useRef<number>(0);
+  const runStateRef = useRef<RunState | null>(null);
 
   useEffect(() => {
     void loadSettings().then((s) => {
@@ -81,33 +86,74 @@ export function App() {
 
   const brainNeedsKey = settings.brain.id !== "ollama" && !settings.brain.apiKey;
 
+  // Agent runs in the side panel (not the service worker) so LLM API fetch is
+  // reliable under host_permissions — SW "Failed to fetch" is a known MV3 pain.
   async function start() {
+    abortRef.current?.abort();
+    const abort = new AbortController();
+    abortRef.current = abort;
+
     setFeed([]);
     setFindings([]);
+    setTranscript([]);
     setError(null);
     setReport({ open: false, loading: false, md: "", error: null });
     setProgress({ completed: 0, total: settings.run.maxIterations, wins: 0 });
     setStatus("running");
     startedAtRef.current = Date.now();
+    runStateRef.current = null;
 
-    const port = chrome.runtime.connect({ name: PORT_NAME });
-    portRef.current = port;
-    port.onMessage.addListener((event: EngineEvent) => onEvent(event));
-    port.onDisconnect.addListener(() => {
-      portRef.current = null;
-      setStatus((s) => (s === "running" ? "stopped" : s));
-    });
+    try {
+      if (settings.brain.id !== "ollama" && !settings.brain.apiKey) {
+        setError(`set an API key for the attacker model (${settings.brain.id})`);
+        setStatus("error");
+        return;
+      }
+      const brain = createProvider(settings.brain);
 
-    let tabId: number | undefined;
-    if (settings.run.targetKind === "tab") {
-      const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-      tabId = tab?.id;
+      let target;
+      if (settings.run.targetKind === "api") {
+        target = createApiTarget(
+          createProvider(settings.targetApi),
+          settings.targetSystemPrompt || undefined,
+        );
+      } else {
+        const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+        if (tab?.id == null) {
+          setError("no active tab to target — focus the page under test, then Launch");
+          setStatus("error");
+          return;
+        }
+        target = createTabTarget(tab.id);
+      }
+
+      const final = await runAgent({
+        config: settings.run,
+        target,
+        brain,
+        emit: onEvent,
+        signal: abort.signal,
+      });
+      runStateRef.current = final;
+      if (!abort.signal.aborted) {
+        setStatus(
+          final.status === "stopped" ? "stopped" : final.status === "error" ? "error" : "done",
+        );
+        if (final.error) setError(final.error);
+      }
+    } catch (e) {
+      if (abort.signal.aborted) {
+        setStatus("stopped");
+        return;
+      }
+      const message = e instanceof Error ? e.message : String(e);
+      setError(message);
+      setStatus("error");
     }
-    port.postMessage({ type: "start", settings, tabId } satisfies PanelMessage);
   }
 
   function stop() {
-    portRef.current?.postMessage({ type: "stop" } satisfies PanelMessage);
+    abortRef.current?.abort();
     setStatus("stopped");
   }
 
@@ -115,6 +161,7 @@ export function App() {
     switch (event.type) {
       case "run:start":
         setProgress({ completed: 0, total: event.state.total, wins: 0 });
+        runStateRef.current = event.state;
         break;
       case "run:progress":
         setProgress({ completed: event.completed, total: event.total, wins: event.wins });
@@ -125,12 +172,25 @@ export function App() {
           ...prev,
         ]);
         break;
+      case "probe":
+        setTranscript((prev) => [...prev, event.probe]);
+        setFeed((prev) => [{ kind: "probe", probe: event.probe }, ...prev]);
+        break;
       case "finding":
         setFindings((prev) => [event.finding, ...prev]);
         setFeed((prev) => [{ kind: "finding", finding: event.finding }, ...prev]);
         break;
       case "run:done":
-        setStatus(event.state.status === "stopped" ? "stopped" : event.state.status === "error" ? "error" : "done");
+        runStateRef.current = event.state;
+        setTranscript(event.state.transcript ?? []);
+        setFindings([...event.state.findings].reverse());
+        setStatus(
+          event.state.status === "stopped"
+            ? "stopped"
+            : event.state.status === "error"
+              ? "error"
+              : "done",
+        );
         break;
       case "run:error":
         setError(event.message);
@@ -138,11 +198,27 @@ export function App() {
         break;
       case "log":
         if (event.level === "error") setError(event.message);
+        else if (event.level === "warn") {
+          // Surface transient retries without failing the run.
+          setError((prev) => prev ?? null);
+        }
         break;
     }
   }
 
   function buildRunState(): RunState {
+    if (runStateRef.current) {
+      return {
+        ...runStateRef.current,
+        findings: runStateRef.current.findings.length
+          ? runStateRef.current.findings
+          : [...findings].reverse(),
+        transcript:
+          runStateRef.current.transcript?.length > 0
+            ? runStateRef.current.transcript
+            : transcript,
+      };
+    }
     return {
       id: `mirage-${startedAtRef.current || Date.now()}`,
       status: status === "running" ? "running" : status === "error" ? "error" : "done",
@@ -150,9 +226,11 @@ export function App() {
       startedAt: startedAtRef.current || Date.now(),
       finishedAt: Date.now(),
       findings: [...findings].reverse(),
+      transcript,
       total: progress.total,
       completed: progress.completed,
       wins: progress.wins,
+      error: error ?? undefined,
     };
   }
 
@@ -282,6 +360,45 @@ export function App() {
               </div>
             </div>
 
+            <div className="row">
+              <div className="field">
+                <label>Pace</label>
+                <select
+                  value={settings.run.pace ?? "balanced"}
+                  disabled={running}
+                  onChange={(e) => {
+                    const pace = e.target.value as "fast" | "balanced" | "thorough";
+                    // Fast defaults to fewer iterations; thorough keeps hunting after wins.
+                    patchRun({
+                      pace,
+                      stopOnFirstWin: pace !== "thorough",
+                      ...(pace === "fast" && settings.run.maxIterations > 12
+                        ? { maxIterations: 10 }
+                        : {}),
+                      ...(pace === "thorough" && settings.run.maxIterations < 16
+                        ? { maxIterations: 20 }
+                        : {}),
+                    });
+                  }}
+                >
+                  <option value="fast">Fast — less context, skip most judges</option>
+                  <option value="balanced">Balanced — smart gating (default)</option>
+                  <option value="thorough">Thorough — full memory, keep hunting</option>
+                </select>
+              </div>
+              <div className="field">
+                <label title="Stop after the first confirmed marker win">Stop on first win</label>
+                <select
+                  value={(settings.run.stopOnFirstWin ?? true) ? "yes" : "no"}
+                  disabled={running}
+                  onChange={(e) => patchRun({ stopOnFirstWin: e.target.value === "yes" })}
+                >
+                  <option value="yes">Yes — exit early</option>
+                  <option value="no">No — keep scanning</option>
+                </select>
+              </div>
+            </div>
+
             <div className="field">
               <label>Goal / objective — run succeeds when the target achieves this</label>
               <div className="chips">
@@ -372,10 +489,12 @@ export function App() {
 
           {error && <div className="err">{error}</div>}
 
-          {/* Live feed */}
+          {/* Live feed — probes include full input/output for export */}
           {feed.map((item, i) =>
             item.kind === "finding" ? (
               <FindingCard key={item.finding.id} finding={item.finding} />
+            ) : item.kind === "probe" ? (
+              <ProbeCard key={`p-${item.probe.iteration}-${i}`} probe={item.probe} />
             ) : (
               <AgentLine key={`a-${i}`} iteration={item.iteration} phase={item.phase} thought={item.thought} />
             ),
@@ -525,6 +644,37 @@ function AgentLine(props: { iteration: number; phase: AgentPhase; thought: strin
       <span className="muted">
         <span className="mono">#{props.iteration}</span> {props.thought}
       </span>
+    </div>
+  );
+}
+
+function ProbeCard({ probe: p }: { probe: ProbeLog }) {
+  const outcomeCls =
+    p.outcome === "CONFIRMED-WIN" ? "win" : p.outcome === "error" ? "err" : p.outcome === "refused" ? "partial" : "";
+  return (
+    <div className={`finding probe ${outcomeCls}`}>
+      <div className="tags">
+        <span className={`tag ${outcomeCls}`}>{p.outcome}</span>
+        <span className="tag">{p.phase}</span>
+        <span className="tag">iter {p.iteration}</span>
+        {p.elapsedMs != null ? <span className="tag">{p.elapsedMs}ms</span> : null}
+      </div>
+      <div className="name">{p.objective}</div>
+      {p.thought ? <div className="reason think">“{p.thought}”</div> : null}
+      <details open={p.outcome === "CONFIRMED-WIN" || p.outcome === "error"}>
+        <summary className="muted" style={{ fontSize: 11, cursor: "pointer", marginTop: 4 }}>
+          input / output
+        </summary>
+        <div className="io-label">▸ attacker → target</div>
+        <pre>{p.prompt}</pre>
+        <div className="io-label">◂ target → attacker</div>
+        <pre>{p.response}</pre>
+        {p.markersHit.length > 0 ? (
+          <div className="muted" style={{ fontSize: 11 }}>
+            matched: {p.markersHit.join(", ")}
+          </div>
+        ) : null}
+      </details>
     </div>
   );
 }

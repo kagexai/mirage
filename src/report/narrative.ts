@@ -38,6 +38,15 @@ export async function generateNarrativeReport(
     config: state.config,
     iterations: state.completed,
     status: state.status,
+    error: state.error,
+    // Full probe log so the narrative can cite real I/O even without wins.
+    transcript: (state.transcript ?? []).map((p) => ({
+      iteration: p.iteration,
+      objective: p.objective,
+      outcome: p.outcome,
+      input: p.prompt.length > 400 ? `${p.prompt.slice(0, 400)}…` : p.prompt,
+      output: p.response.length > 600 ? `${p.response.slice(0, 600)}…` : p.response,
+    })),
     findings: state.findings.map((f) => ({
       objective: f.objective,
       category: f.category,

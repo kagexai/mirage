@@ -6,13 +6,15 @@ import {
   type Provider,
   type ProviderConfig,
 } from "./types";
+import { fetchWithRetry, isNetworkError, networkErrorMessage, safeText } from "./http";
 
 // Anthropic Messages API adapter. `system` is a top-level field (not a message
 // role), so we split it out. The browser-access header opts into direct calls
 // from an extension context.
 export function createAnthropicProvider(cfg: ProviderConfig): Provider {
-  const model = cfg.model || "claude-opus-4-8";
-  const baseUrl = cfg.baseUrl || "https://api.anthropic.com";
+  const model = cfg.model || "claude-haiku-4-5";
+  const baseUrl = (cfg.baseUrl || "https://api.anthropic.com").replace(/\/+$/, "");
+  const url = `${baseUrl}/v1/messages`;
 
   return {
     id: "anthropic",
@@ -30,17 +32,29 @@ export function createAnthropicProvider(cfg: ProviderConfig): Provider {
       };
       if (system) body.system = system;
 
-      const res = await fetch(`${baseUrl}/v1/messages`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-api-key": cfg.apiKey,
-          "anthropic-version": "2023-06-01",
-          "anthropic-dangerous-direct-browser-access": "true",
-        },
-        body: JSON.stringify(body),
-        signal: opts.signal,
-      });
+      let res: Response;
+      try {
+        res = await fetchWithRetry(
+          url,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              "x-api-key": cfg.apiKey,
+              "anthropic-version": "2023-06-01",
+              "anthropic-dangerous-direct-browser-access": "true",
+            },
+            body: JSON.stringify(body),
+            signal: opts.signal,
+          },
+          { retries: 1, label: "Anthropic" },
+        );
+      } catch (e) {
+        if (isNetworkError(e) || e instanceof TypeError) {
+          throw new ProviderError(networkErrorMessage("Anthropic", url, e));
+        }
+        throw e;
+      }
 
       if (!res.ok) {
         throw new ProviderError(`Anthropic ${res.status}: ${await safeText(res)}`, res.status);
@@ -61,12 +75,4 @@ export function createAnthropicProvider(cfg: ProviderConfig): Provider {
 function extractSystem(messages: ChatMessage[]): string | undefined {
   const sys = messages.filter((m) => m.role === "system").map((m) => m.content);
   return sys.length ? sys.join("\n\n") : undefined;
-}
-
-async function safeText(res: Response): Promise<string> {
-  try {
-    return (await res.text()).slice(0, 400);
-  } catch {
-    return "<no body>";
-  }
 }

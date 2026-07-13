@@ -28,23 +28,39 @@ const CONTENT_SCRIPT = "content-scripts/content.js";
 export function createTabTarget(tabId: number): Target {
   let ready = false;
 
-  // Content scripts only auto-inject on pages loaded AFTER the extension is
-  // installed. A pre-existing tab has no listener → "Receiving end does not
-  // exist". So ping first; if nobody answers, inject the content script
-  // programmatically (once), then proceed.
   async function ensureReady(): Promise<void> {
-    if (ready) return;
+    if (ready) {
+      // Re-ping: navigations drop the content-script listener.
+      if (await ping(tabId)) return;
+      ready = false;
+    }
     if (await ping(tabId)) {
       ready = true;
       return;
     }
+
+    // Blocked schemes — fail with a clear message (no inject attempt).
+    const url = await tabUrl(tabId);
+    if (url && isBlockedUrl(url)) {
+      throw new Error(
+        `cannot inject into this page (${url}). Chrome blocks chrome://, the Web Store, ` +
+          `extension pages, and PDFs. Open a normal http(s) site with the AI chat UI.`,
+      );
+    }
+
     try {
       await chrome.scripting.executeScript({ target: { tabId }, files: [CONTENT_SCRIPT] });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(formatInjectError(msg, url));
+    }
+
+    // Brief settle so the message listener is registered.
+    await delay(50);
+    if (!(await ping(tabId))) {
       throw new Error(
-        `could not inject into the tab (${msg}). Open a normal http/https page — Chrome blocks ` +
-          `injection on chrome:// pages, the Web Store, and PDFs.`,
+        `content script injected but not responding on ${url || `tab #${tabId}`}. ` +
+          `Reload the page, then Launch again.`,
       );
     }
     ready = true;
@@ -55,9 +71,22 @@ export function createTabTarget(tabId: number): Target {
     label: `Tab · #${tabId}`,
     async send(prompt: string): Promise<TargetResponse> {
       await ensureReady();
-      const reply = await sendToTab(tabId, { type: "mirage:send", prompt });
-      if (!reply.ok) throw new Error(reply.error || "tab target failed to respond");
-      return { response: reply.response ?? "", sideEffects: reply.sideEffects };
+      try {
+        const reply = await sendToTab(tabId, { type: "mirage:send", prompt });
+        if (!reply.ok) throw new Error(reply.error || "tab target failed to respond");
+        return { response: reply.response ?? "", sideEffects: reply.sideEffects };
+      } catch (e) {
+        // One re-inject if the page navigated mid-run.
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/Receiving end does not exist|message port closed|unreachable/i.test(msg)) {
+          ready = false;
+          await ensureReady();
+          const reply = await sendToTab(tabId, { type: "mirage:send", prompt });
+          if (!reply.ok) throw new Error(reply.error || "tab target failed to respond");
+          return { response: reply.response ?? "", sideEffects: reply.sideEffects };
+        }
+        throw e;
+      }
     },
     reset() {
       void ensureReady()
@@ -67,7 +96,51 @@ export function createTabTarget(tabId: number): Target {
   };
 }
 
-// Returns true if a content-script listener answered.
+function isBlockedUrl(url: string): boolean {
+  return /^(chrome|chrome-extension|edge|about|devtools|view-source):/i.test(url) ||
+    /chrome\.google\.com\/webstore/i.test(url) ||
+    /\.pdf($|\?)/i.test(url);
+}
+
+function formatInjectError(msg: string, url: string | undefined): string {
+  const host = url ? safeHost(url) : "this page";
+  if (/must request permission to access this host|Cannot access contents of url/i.test(msg)) {
+    return (
+      `no host permission for ${host}. ` +
+      `Reload Mirage after rebuild (chrome://extensions → Mirage → Reload), ` +
+      `accept any new permissions prompt, then open the target tab and Launch again. ` +
+      `Detail: ${msg}`
+    );
+  }
+  if (/Cannot access a chrome:|extension gallery|Cannot access contents/i.test(msg)) {
+    return (
+      `cannot inject into ${host} (${msg}). ` +
+      `Use a normal http(s) page — not chrome://, Web Store, or PDFs.`
+    );
+  }
+  return (
+    `could not inject into ${host} (${msg}). ` +
+    `Reload the tab, confirm Mirage has site access, then Launch again.`
+  );
+}
+
+function safeHost(url: string): string {
+  try {
+    return new URL(url).host || url;
+  } catch {
+    return url;
+  }
+}
+
+async function tabUrl(tabId: number): Promise<string | undefined> {
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    return tab.url;
+  } catch {
+    return undefined;
+  }
+}
+
 function ping(tabId: number): Promise<boolean> {
   return new Promise((resolve) => {
     try {
@@ -91,4 +164,15 @@ function sendToTab(tabId: number, message: TabMessage): Promise<TabReply> {
       resolve(reply ?? { ok: false, error: "no reply from content script" });
     });
   });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** True for hard failures where retrying more probes is useless. */
+export function isFatalTabError(message: string): boolean {
+  return /no host permission|must request permission|cannot inject into this page|Cannot access contents of url|chrome:\/\/|blocked/i.test(
+    message,
+  );
 }

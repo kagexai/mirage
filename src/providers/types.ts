@@ -12,6 +12,9 @@ export interface ChatOptions {
   // Some callers (e.g. the judge) want low-variance output.
   temperature?: number;
   signal?: AbortSignal;
+  // Hint that the caller wants a JSON object (OpenAI/xAI honor response_format).
+  // Reduces parse retries when the brain must return structured decisions.
+  jsonMode?: boolean;
 }
 
 export interface ChatResult {
@@ -37,10 +40,12 @@ export interface ProviderConfig {
   baseUrl?: string;
 }
 
+// Prefer latency-friendly defaults for the attacker loop (one call per iteration).
+// Operators can switch to flagship models in Settings when quality matters more.
 export const DEFAULT_MODELS: Record<ProviderId, string> = {
-  anthropic: "claude-opus-4-8",
-  openai: "gpt-4o",
-  xai: "grok-4.5",
+  anthropic: "claude-haiku-4-5",
+  openai: "gpt-4o-mini",
+  xai: "grok-4-fast",
   ollama: "mistral:latest",
 };
 
