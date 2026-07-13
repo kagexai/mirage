@@ -1,0 +1,33 @@
+{
+  "name": "mirage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mirage — an AI red-team browser extension that attacks your AI like a real attacker would. OWASP-LLM plugin packs, multi-provider (Claude/OpenAI/Grok/local), deterministic scoring.",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "dev:firefox": "wxt -b firefox",
+    "build": "wxt build",
+    "build:firefox": "wxt build -b firefox",
+    "zip": "wxt zip",
+    "compile": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "postinstall": "wxt prepare"
+  },
+  "dependencies": {
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "yaml": "^2.6.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@wxt-dev/module-react": "^1.1.3",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8",
+    "wxt": "^0.19.29"
+  }
+}
