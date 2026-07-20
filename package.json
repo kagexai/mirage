@@ -1,6 +1,6 @@
 {
   "name": "mirage",
-  "version": "0.2.0.0",
+  "version": "0.3.0.0",
   "private": true,
   "description": "Mirage — an AI red-team browser extension that attacks your AI like a real attacker would. OWASP-LLM plugin packs, multi-provider (Claude/OpenAI/Grok/local), deterministic scoring.",
   "type": "module",
