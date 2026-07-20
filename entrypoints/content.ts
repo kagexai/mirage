@@ -1,5 +1,6 @@
 import { defineContentScript } from "wxt/sandbox";
 import type { TabMessage, TabReply } from "@/src/targets/tab";
+import { findBestComposer, isPageChromeNoise } from "@/src/targets/composer";
 import {
   extractReplyFromTranscript,
   isLabelOnly,
@@ -26,25 +27,27 @@ export default defineContentScript({
           sendReply({ ok: true });
           return false;
         }
+        if (msg.type === "mirage:prepare") {
+          try {
+            sendReply(handlePrepare());
+          } catch (e) {
+            sendReply({ ok: false, error: e instanceof Error ? e.message : String(e) });
+          }
+          return false;
+        }
+        if (msg.type === "mirage:await") {
+          void handleAwait(msg.prompt, msg.beforeAssistant, msg.beforeBlob).then(
+            sendReply,
+            (e: unknown) =>
+              sendReply({ ok: false, error: e instanceof Error ? e.message : String(e) }),
+          );
+          return true;
+        }
         if (msg.type === "mirage:send") {
           void handleSend(msg.prompt).then(sendReply, (e: unknown) =>
             sendReply({ ok: false, error: e instanceof Error ? e.message : String(e) }),
           );
           return true; // async reply
-        }
-        if (msg.type === "mirage:scroll") {
-          doScroll(msg.direction);
-          sendReply({ ok: true });
-          return false;
-        }
-        if (msg.type === "mirage:read") {
-          sendReply({ ok: true, snapshot: readSnapshot() });
-          return false;
-        }
-        if (msg.type === "mirage:click") {
-          const r = doClick(msg.selector, msg.text);
-          sendReply({ ok: true, clicked: r.clicked, clickedLabel: r.label });
-          return false;
         }
         return false;
       },
@@ -52,158 +55,169 @@ export default defineContentScript({
   },
 });
 
-// ── Browser controls (scroll / read / click) ──────────────────────────────────
+function handlePrepare(): TabReply {
+  // Ensure Chat tab (not "Under The Hood") so the panel is visible for later wait.
+  const chatTab = document.getElementById("chat-tab-btn");
+  if (chatTab) chatTab.click();
 
-function doScroll(direction: "up" | "down" | "top" | "bottom"): void {
   const root = findChatRoot();
-  const winStep = Math.round(window.innerHeight * 0.9);
-  const rootStep = Math.round((root.clientHeight || winStep) * 0.9);
-  switch (direction) {
-    case "top":
-      window.scrollTo({ top: 0 });
-      root.scrollTop = 0;
-      break;
-    case "bottom":
-      window.scrollTo({ top: document.body.scrollHeight });
-      root.scrollTop = root.scrollHeight;
-      break;
-    case "up":
-      window.scrollBy({ top: -winStep });
-      root.scrollTop -= rootStep;
-      break;
-    case "down":
-      window.scrollBy({ top: winStep });
-      root.scrollTop += rootStep;
-      break;
-  }
-}
-
-function readSnapshot() {
-  const root = findChatRoot();
-  const buttons = [...document.querySelectorAll<HTMLElement>('button, [role="button"], input[type="submit"]')]
-    .filter(isVisible)
-    .map((b) => normalizeWs(b.getAttribute("aria-label") || b.textContent || (b as HTMLInputElement).value || ""))
-    .filter((t) => t.length > 0 && t.length < 40);
-  const headings = [...document.querySelectorAll<HTMLElement>("h1, h2, h3")]
-    .map((h) => normalizeWs(h.textContent || ""))
-    .filter(Boolean);
-  const text = normalizeWs(root.innerText || document.body.innerText || "");
+  const input = findComposer();
   return {
-    url: location.href,
-    title: document.title,
-    composerFound: !!findComposer(),
-    buttons: dedup(buttons).slice(0, 24),
-    headings: dedup(headings).slice(0, 12),
-    textPreview: text.slice(0, 1600),
-    messageCount: messageCandidates(root).length,
+    ok: true,
+    beforeAssistant: snapshotAssistantTexts(root),
+    beforeBlob: root.innerText ?? "",
+    composerId: input?.id || input?.tagName.toLowerCase(),
   };
 }
 
-function doClick(selector?: string, text?: string): { clicked: boolean; label?: string } {
-  let el: HTMLElement | null = null;
-  if (selector) {
-    try {
-      el = document.querySelector<HTMLElement>(selector);
-    } catch {
-      el = null;
-    }
+async function handleAwait(
+  prompt: string,
+  beforeAssistant: string[],
+  beforeBlob: string,
+): Promise<TabReply> {
+  const root = findChatRoot();
+  const response = await waitForAssistantReply(root, beforeAssistant, beforeBlob, prompt);
+  const sideEffects = scanSideEffects(root);
+  if (!response.trim()) {
+    const humanSeen = chatContainsPromptEcho(root, prompt);
+    return {
+      ok: false,
+      error: humanSeen
+        ? "prompt was sent but no assistant reply appeared (API slow, error, or blocked?)"
+        : "no assistant reply detected — page may not have accepted the submit (composer not wired)",
+    };
   }
-  if (!el && text) {
-    const want = text.toLowerCase();
-    const clickables = [
-      ...document.querySelectorAll<HTMLElement>('button, a, [role="button"], input[type="submit"], [onclick]'),
-    ].filter(isVisible);
-    el =
-      clickables.find((c) => {
-        const label = `${c.getAttribute("aria-label") ?? ""} ${c.textContent ?? ""} ${c.getAttribute("title") ?? ""}`.toLowerCase();
-        return label.includes(want);
-      }) ?? null;
-  }
-  if (el && isVisible(el)) {
-    const label = normalizeWs(el.getAttribute("aria-label") || el.textContent || "").slice(0, 60);
-    el.click();
-    return { clicked: true, label };
-  }
-  return { clicked: false };
+  return { ok: true, response, sideEffects };
 }
 
-function dedup(arr: string[]): string[] {
-  return [...new Set(arr)];
+function chatContainsPromptEcho(root: HTMLElement, prompt: string): boolean {
+  const slice = prompt.trim().slice(0, 48);
+  if (slice.length < 8) return false;
+  return (root.innerText ?? "").includes(slice);
 }
 
 async function handleSend(prompt: string): Promise<TabReply> {
+  // promptairlines: "Under The Hood" hides the composer — force Chat tab first.
+  const chatTab = document.getElementById("chat-tab-btn");
+  if (chatTab && isVisible(chatTab)) chatTab.click();
+
   const input = findComposer();
   if (!input) return { ok: false, error: "no chat composer found on this page" };
 
   const root = findChatRoot();
   const beforeMsgs = snapshotAssistantTexts(root);
   const beforeBlob = root.innerText ?? "";
+  const beforeCount = countChatBubbles(root);
 
   setComposerValue(input, prompt);
+  await delay(50);
+  // jQuery UIs (promptairlines submitMessage reads $('#chatInput').val()) —
+  // re-assert if the framework cleared/ignored the first write.
+  if (!composerHasValue(input, prompt)) setComposerValue(input, prompt);
+  if (!composerHasValue(input, prompt)) {
+    return {
+      ok: false,
+      error: `could not write prompt into composer (#${input.id || input.tagName.toLowerCase()})`,
+    };
+  }
+
   await delay(80);
   submit(input);
 
   // Give the UI a beat to render the user bubble / typing indicator so we don't
   // mistake those for the assistant reply.
-  await delay(250);
+  await delay(300);
+
+  // If the site never accepted the message, fail clearly instead of scraping chrome.
+  if (
+    composerHasValue(input, prompt) &&
+    countChatBubbles(root) <= beforeCount &&
+    !(root.innerText ?? "").includes(prompt.slice(0, Math.min(40, prompt.length)))
+  ) {
+    // Still waiting — submitMessage may be async before logMessage. Don't early-fail yet.
+  }
 
   const response = await waitForAssistantReply(root, beforeMsgs, beforeBlob, prompt);
   const sideEffects = scanSideEffects(root);
+  if (!response.trim()) {
+    return {
+      ok: false,
+      error:
+        "no assistant reply detected in the chat panel — check that the Chat tab is active " +
+        "and the prompt was sent (composer: #" +
+        (input.id || input.tagName.toLowerCase()) +
+        ")",
+    };
+  }
   return { ok: true, response, sideEffects };
 }
 
 function findChatRoot(): HTMLElement {
+  // Prefer the message list — never fall through to body if a chat panel exists
+  // (body text-diff returns "Chat / Under The Hood / SHARE THIS GAME…" chrome).
   const candidates = [
+    document.querySelector<HTMLElement>(".inner-content"),
+    document.getElementById("chat-content"),
+    document.getElementById("chat-container"),
+    document.getElementById("chatWindow"),
     document.getElementById("chat-history"),
     document.getElementById("chat-box"),
     document.getElementById("messages"),
-    document.querySelector<HTMLElement>("[data-chat], .chat-history, .messages, .conversation"),
+    document.querySelector<HTMLElement>(
+      "[data-chat], .chat-history, .messages, .conversation, .chat-content, [class*='chat-message']",
+    ),
     document.querySelector("main"),
-    document.body,
   ];
-  return candidates.find((el): el is HTMLElement => !!el) ?? document.body;
+  for (const el of candidates) {
+    // Chat roots may be overflow-scrolled with a small client box — don't require large area.
+    if (el && isPresent(el)) return el;
+  }
+  // last resort — but waitForAssistantReply will refuse body-level chrome diffs
+  return document.body;
+}
+
+/** Element exists in layout (not display:none). Softer than isVisible for panels. */
+function isPresent(el: Element): boolean {
+  const style = getComputedStyle(el);
+  if (style.display === "none" || style.visibility === "hidden") return false;
+  // offsetParent null can mean fixed/body — still allow if it has any box
+  const r = el.getBoundingClientRect();
+  return r.width > 0 || r.height > 0 || (el as HTMLElement).offsetParent !== null;
+}
+
+function countChatBubbles(root: HTMLElement): number {
+  return root.querySelectorAll(
+    "[class*='ai-message'], [class*='human-message'], [class*='message'], [data-role], .bubble",
+  ).length;
+}
+
+function composerHasValue(el: HTMLElement, expected: string): boolean {
+  const want = expected.trim();
+  if (el.isContentEditable) {
+    return normalizeWs(el.textContent ?? "").includes(normalizeWs(want).slice(0, 40));
+  }
+  const v = ((el as HTMLInputElement | HTMLTextAreaElement).value ?? "").trim();
+  return v === want || v.includes(want.slice(0, Math.min(40, want.length)));
 }
 
 function isVisible(el: Element): boolean {
   const r = el.getBoundingClientRect();
   const style = getComputedStyle(el);
-  return r.width > 40 && r.height > 12 && style.visibility !== "hidden" && style.display !== "none";
+  // Send icons can be ~32–36px wide — keep threshold modest.
+  return r.width > 16 && r.height > 12 && style.visibility !== "hidden" && style.display !== "none";
 }
 
 function findComposer(): HTMLElement | null {
-  const preferIds = [
-    "message-input",
-    "prompt-input",
-    "chat-input",
-    "prompt",
-    "query-input",
-    "user-input",
-  ];
-  for (const id of preferIds) {
-    const el = document.getElementById(id);
-    if (el && isVisible(el)) return el as HTMLElement;
-  }
-
-  const candidates = [
-    ...document.querySelectorAll<HTMLElement>(
-      'textarea, [contenteditable="true"], input[type="text"], input[type="search"], input:not([type])',
-    ),
-  ].filter((el) => isVisible(el) && !(el as HTMLInputElement).disabled);
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => area(b) - area(a));
-  return candidates[0] ?? null;
-}
-
-function area(el: Element): number {
-  const r = el.getBoundingClientRect();
-  return r.width * r.height;
+  // Score chat vs flag/search/auth fields — never pick by area alone
+  // (promptairlines.com: full-width #flagInput vs #chatInput textarea).
+  return findBestComposer(document);
 }
 
 function setComposerValue(el: HTMLElement, value: string): void {
   el.focus();
   if (el.isContentEditable) {
     el.textContent = value;
-    el.dispatchEvent(new InputEvent("input", { bubbles: true }));
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
     return;
   }
   const field = el as HTMLInputElement | HTMLTextAreaElement;
@@ -213,9 +227,30 @@ function setComposerValue(el: HTMLElement, value: string): void {
       : HTMLInputElement.prototype;
   const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
   setter ? setter.call(field, value) : (field.value = value);
+  // Native events for React-style controlled inputs.
   field.dispatchEvent(new Event("input", { bubbles: true }));
   field.dispatchEvent(new Event("change", { bubbles: true }));
+  field.dispatchEvent(new InputEvent("input", { bubbles: true, data: value, inputType: "insertText" }));
+
+  // jQuery sites (promptairlines) read via $(el).val() — keep in sync.
+  const jq = (window as unknown as { jQuery?: JQueryLike; $?: JQueryLike }).jQuery
+    ?? (window as unknown as { $?: JQueryLike }).$;
+  if (typeof jq === "function") {
+    try {
+      const $el = jq(field);
+      $el.val?.(value);
+      $el.trigger?.("input");
+      $el.trigger?.("change");
+    } catch {
+      /* ignore */
+    }
+  }
 }
+
+type JQueryLike = (el: Element) => {
+  val?: (v?: string) => unknown;
+  trigger?: (ev: string) => unknown;
+};
 
 function submit(el: HTMLElement): void {
   const btn = findSendButton(el);
@@ -236,21 +271,45 @@ function findSendButton(input: HTMLElement): HTMLElement | null {
   const scope = input.closest("form") ?? input.parentElement?.parentElement ?? document.body;
   const buttons = [
     ...scope.querySelectorAll<HTMLElement>('button, [role="button"], input[type="submit"]'),
-  ];
-  // Prefer known FreakLab / chat ids.
-  for (const id of ["send-button", "send-btn", "execute-btn", "ask-btn"]) {
+  ].filter(isVisible);
+
+  // Prefer known chat send ids (incl. promptairlines sendMessageBtn).
+  for (const id of [
+    "send-button",
+    "send-btn",
+    "sendMessageBtn",
+    "send-message",
+    "execute-btn",
+    "ask-btn",
+  ]) {
     const el = document.getElementById(id);
     if (el && isVisible(el)) return el;
   }
+
+  const labelOf = (b: HTMLElement) =>
+    `${b.id} ${b.getAttribute("aria-label") ?? ""} ${b.textContent ?? ""} ${b.getAttribute("title") ?? ""}`.toLowerCase();
+
+  // Never treat flag-check / upload as the chat send control.
+  const notFlag = (b: HTMLElement) => !/flag|ctf|upload|check.?in|login/i.test(labelOf(b));
+
   const match = buttons.find((b) => {
-    const label =
-      `${b.getAttribute("aria-label") ?? ""} ${b.textContent ?? ""} ${b.getAttribute("title") ?? ""}`.toLowerCase();
-    return /send|submit|ask|run|go/.test(label) && !/stop|cancel|clear|new chat/i.test(label);
+    const label = labelOf(b);
+    return (
+      notFlag(b) &&
+      /send|submit|ask|run|go|reply/i.test(label) &&
+      !/stop|cancel|clear|new chat/i.test(label)
+    );
   });
-  return match ?? buttons.find((b) => isVisible(b)) ?? null;
+  if (match) return match;
+
+  // Nearest visible button to the composer that isn't flag chrome.
+  return buttons.find(notFlag) ?? null;
 }
 
 // ── Assistant reply extraction ────────────────────────────────────────────────
+// Pure text helpers (stripEchoAndNoise / normalizeWs / isTypingNoise /
+// isLabelOnly / extractReplyFromTranscript) live in src/targets/reply.ts so they
+// are unit-testable without the DOM.
 
 interface MsgNode {
   role: "user" | "assistant" | "unknown";
@@ -295,6 +354,11 @@ function messageCandidates(root: HTMLElement): Element[] {
     ".chat-message",
     ".msg",
     ".bubble",
+    // promptairlines.com bubbles
+    "[class*='ai-message']",
+    "[class*='human-message']",
+    ".inner-content > div",
+    "#chat-content .inner-content > div",
     "#chat-history > *",
     "#chat-box > *",
     "#messages > *",
@@ -314,6 +378,8 @@ function messageCandidates(root: HTMLElement): Element[] {
       if (!text || text.length < 1) continue;
       // Skip the composer itself.
       if (el.matches("textarea, input, [contenteditable='true']")) continue;
+      // Skip pure page chrome nodes.
+      if (isPageChromeNoise(text)) continue;
       seen.add(el);
       out.push(el);
     }
@@ -346,13 +412,13 @@ async function waitForAssistantReply(
   beforeAssistant: string[],
   beforeBlob: string,
   prompt: string,
-  timeoutMs = 45000,
+  timeoutMs = 60000,
 ): Promise<string> {
   const start = Date.now();
   const POLL = 250;
-  const SETTLE = 800; // wait for stream to finish growing
-  const MIN_WAIT = 1200; // never return in the first 1.2s (user bubble phase)
-  const NO_REPLY_BAILOUT = 12000;
+  const SETTLE = 600; // wait for stream to finish growing
+  const MIN_WAIT = 800; // user bubble phase
+  // Don't give up early — labs can take 15–30s; only exit empty at full timeout.
 
   let lastCandidate = "";
   let stableFor = 0;
@@ -364,40 +430,44 @@ async function waitForAssistantReply(
     await delay(POLL);
     if (Date.now() - start < MIN_WAIT) continue;
 
-    // 1) Structured: new assistant (or unknown non-user) messages.
-    const msgs = readMessages(root);
-    const fresh = msgs.filter((m) => {
-      if (m.role === "user") return false;
-      const n = normalizeWs(m.text);
-      if (!n || isTypingNoise(n)) return false;
-      // A bare speaker label ("USER@ECORP:", "MOBLEY:") is not a reply.
-      if (isLabelOnly(n)) return false;
-      if (beforeSet.has(n)) return false;
-      // Skip pure echoes of our prompt.
-      if (n === promptNorm || (promptNorm.includes(n) && n.length < promptNorm.length * 1.05)) {
-        return false;
-      }
-      if (n.startsWith(promptNorm) && stripEchoAndNoise(n, prompt).length < 12) return false;
-      return true;
-    });
+    // 0) Fast path: dedicated AI bubble classes (promptairlines bg-ai-message-bg).
+    let candidate = latestNewAiBubble(root, beforeSet, promptNorm, prompt);
 
-    let candidate = "";
-    if (fresh.length > 0) {
-      // Prefer last assistant-labeled; else last fresh unknown after strip.
-      const assistants = fresh.filter((m) => m.role === "assistant");
-      const pick = (assistants.length ? assistants : fresh)[assistants.length ? assistants.length - 1 : fresh.length - 1]!;
-      candidate = stripLeadingSpeaker(stripEchoAndNoise(pick.text, prompt));
-      // If multiple new assistant chunks streamed as separate nodes, join recent ones.
-      if (assistants.length > 1) {
-        const joined = assistants
-          .map((m) => stripLeadingSpeaker(stripEchoAndNoise(m.text, prompt)))
-          .filter(Boolean)
-          .join("\n");
-        if (joined.length > candidate.length) candidate = joined;
+    // 1) Structured: new assistant (or unknown non-user) messages.
+    if (!candidate || candidate.length < 4) {
+      const msgs = readMessages(root);
+      const fresh = msgs.filter((m) => {
+        if (m.role === "user") return false;
+        const n = normalizeWs(m.text);
+        if (!n || isTypingNoise(n) || isPageChromeNoise(n)) return false;
+        // A bare speaker label ("USER@ECORP:", "MOBLEY:") is not a reply.
+        if (isLabelOnly(n)) return false;
+        if (beforeSet.has(n)) return false;
+        // Skip pure echoes of our prompt.
+        if (n === promptNorm || (promptNorm.includes(n) && n.length < promptNorm.length * 1.05)) {
+          return false;
+        }
+        if (n.startsWith(promptNorm) && stripEchoAndNoise(n, prompt).length < 12) return false;
+        return true;
+      });
+
+      if (fresh.length > 0) {
+        const assistants = fresh.filter((m) => m.role === "assistant");
+        const pick = (assistants.length ? assistants : fresh)[
+          assistants.length ? assistants.length - 1 : fresh.length - 1
+        ]!;
+        candidate = stripLeadingSpeaker(stripEchoAndNoise(pick.text, prompt));
+        if (assistants.length > 1) {
+          const joined = assistants
+            .map((m) => stripLeadingSpeaker(stripEchoAndNoise(m.text, prompt)))
+            .filter(Boolean)
+            .join("\n");
+          if (joined.length > candidate.length) candidate = joined;
+        }
       }
     }
 
-    // 2) Speaker-aware: parse the full transcript into "SPEAKER: text" turns and
+    // 1.5) Speaker-aware: parse the full transcript into "SPEAKER: text" turns and
     // take what came after our prompt echo. Robust on multi-agent lab/CTF pages
     // where structured nodes are just labels (e.g. SentinelGoat's MOBLEY panel).
     if (!candidate || candidate.length < 8 || isLabelOnly(candidate)) {
@@ -407,17 +477,20 @@ async function waitForAssistantReply(
       }
     }
 
-    // 3) Fallback: text diff of chat root, strip echo + typing + leading label.
-    if (!candidate || candidate.length < 8 || isLabelOnly(candidate)) {
+    // 2) Fallback: text diff of chat root ONLY (never document.body — pure chrome).
+    if ((!candidate || candidate.length < 8 || isLabelOnly(candidate)) && root !== document.body) {
       const added = diffTail(beforeBlob, root.innerText ?? "");
       candidate = stripLeadingSpeaker(stripEchoAndNoise(added, prompt));
     }
 
-    // Still only noise?
-    if (!candidate || isTypingNoise(candidate) || isLabelOnly(candidate) || normalizeWs(candidate) === promptNorm) {
-      if (!sawReal && Date.now() - start >= NO_REPLY_BAILOUT) {
-        return ""; // nothing real arrived
-      }
+    // Still only noise / page chrome?
+    if (
+      !candidate ||
+      isTypingNoise(candidate) ||
+      isPageChromeNoise(candidate) ||
+      isLabelOnly(candidate) ||
+      normalizeWs(candidate) === promptNorm
+    ) {
       stableFor = 0;
       lastCandidate = "";
       continue;
@@ -433,7 +506,50 @@ async function waitForAssistantReply(
     }
   }
 
-  return lastCandidate.trim();
+  return sawReal ? lastCandidate.trim() : "";
+}
+
+/** Last new AI-styled bubble text not present before the probe. */
+function latestNewAiBubble(
+  root: HTMLElement,
+  beforeSet: Set<string>,
+  promptNorm: string,
+  prompt: string,
+): string {
+  const nodes = [
+    ...root.querySelectorAll<HTMLElement>(
+      "[class*='ai-message'], [class*='assistant'], [data-role='assistant'], [data-message-author-role='assistant']",
+    ),
+  ];
+  // Also scan .inner-content children that look assistant-side (logo + bubble).
+  const inner = root.matches(".inner-content")
+    ? root
+    : root.querySelector<HTMLElement>(".inner-content");
+  if (inner) {
+    for (const child of inner.children) {
+      if (!(child instanceof HTMLElement)) continue;
+      if (child.querySelector("[class*='ai-message'], img[src*='logo']")) {
+        nodes.push(child);
+      }
+    }
+  }
+
+  let best = "";
+  for (const el of nodes) {
+    const raw = (el.innerText ?? "").trim();
+    const n = normalizeWs(raw);
+    if (!n || beforeSet.has(n) || isTypingNoise(n) || isPageChromeNoise(n)) continue;
+    if (n === promptNorm) continue;
+    // Skip human row (justify-end / human-message)
+    const cls = (el.className?.toString?.() ?? "").toLowerCase();
+    if (/human-message|justify-end/.test(cls) && !/ai-message/.test(cls)) continue;
+    if (el.querySelector("[class*='human-message']") && !el.querySelector("[class*='ai-message']")) {
+      continue;
+    }
+    const cleaned = stripEchoAndNoise(raw, prompt);
+    if (cleaned.length >= best.length) best = cleaned;
+  }
+  return best;
 }
 
 function diffTail(before: string, after: string): string {

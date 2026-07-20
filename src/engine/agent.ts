@@ -20,6 +20,7 @@ import type { ChatMessage, Provider } from "@/src/providers/types";
 import type { Target } from "@/src/targets/types";
 import type { Capture, EngineEvent, Finding, ProbeLog, RunState, StepResult } from "./run";
 import { isFatalTabError } from "@/src/targets/tab";
+import { looksLikeFlagValidationResponse } from "@/src/targets/composer";
 
 const MAX_AUTO_CONTINUES = 2;
 
@@ -349,6 +350,17 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
         outcome,
         markersHit: conf.markersHit,
       });
+
+      // Tab target sometimes lands on flag-validation / non-chat fields. Surface
+      // that so the brain stops treating "wrong flag" UI noise as AI refusals.
+      if (looksLikeFlagValidationResponse(response)) {
+        const note =
+          "WRONG INPUT TARGET suspected: reply looks like flag-validation UI " +
+          "(e.g. wrong/invalid flag), not the chat AI. Do not thrash flag formats — " +
+          "you are not talking to the model. Operator may need to focus the chat composer.";
+        memory.push({ kind: "note", iteration, note });
+        emit({ type: "log", level: "warn", message: note });
+      }
 
       // Feed the outcome + adaptive strategy hints back as the next observation.
       const hints = strategyHints(memory);

@@ -21,6 +21,19 @@ All notable changes to Mirage are documented in this file.
 - Reply capture returned a bare speaker label (e.g. `USER@ECORP:`) instead of the agent's actual response on multi-agent CTF pages — now rejected and parsed correctly
 - Attack counter lagged the transcript when a run was stopped mid-probe (during the goal-judge)
 
+## [0.2.1.0] - 2026-07-17
+
+### Fixed
+- **Wrong chat composer** on multi-field pages (e.g. promptairlines.com `#flagInput` vs `#chatInput`): score chat textareas over flag, search, and auth fields
+- **Page chrome scraped as the model reply** ("Chat / Under The Hood / SHARE THIS GAME…"): scope reads to the chat panel and reject site chrome
+- **Tab probes that never reached the model**: fill and submit run in the page MAIN world so jQuery / `submitMessage()` see the value (isolated content scripts share DOM, not page JS)
+- Clearer errors when submit is accepted but no assistant bubble appears, or when the page never accepts the send
+- Agent memory note + tactic when replies look like flag-validation UI noise
+
+### Added
+- Composer scoring module (`src/targets/composer.ts`) with unit tests for chat-vs-flag ranking and chrome detection
+- `mirage:prepare` / `mirage:await` content-script handshake for MAIN-world submit + isolated wait
+
 ## [0.2.0.0] - 2026-07-13
 
 ### Added

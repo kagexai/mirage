@@ -5,6 +5,17 @@ export interface TabSendMessage {
   type: "mirage:send";
   prompt: string;
 }
+/** Snapshot chat state before a MAIN-world submit. */
+export interface TabPrepareMessage {
+  type: "mirage:prepare";
+}
+/** Wait for assistant reply after MAIN-world submit. */
+export interface TabAwaitMessage {
+  type: "mirage:await";
+  prompt: string;
+  beforeAssistant: string[];
+  beforeBlob: string;
+}
 export interface TabResetMessage {
   type: "mirage:reset";
 }
@@ -25,6 +36,8 @@ export interface TabClickMessage {
 }
 export type TabMessage =
   | TabSendMessage
+  | TabPrepareMessage
+  | TabAwaitMessage
   | TabResetMessage
   | TabPingMessage
   | TabScrollMessage
@@ -38,6 +51,10 @@ export interface TabReply {
   snapshot?: PageSnapshot;
   clicked?: boolean;
   clickedLabel?: string;
+  /** From mirage:prepare */
+  beforeAssistant?: string[];
+  beforeBlob?: string;
+  composerId?: string;
 }
 
 // Path of the built content script (WXT emits it here in both dev and build).
@@ -93,18 +110,14 @@ export function createTabTarget(tabId: number): Target {
     async send(prompt: string): Promise<TargetResponse> {
       await ensureReady();
       try {
-        const reply = await sendToTab(tabId, { type: "mirage:send", prompt });
-        if (!reply.ok) throw new Error(reply.error || "tab target failed to respond");
-        return { response: reply.response ?? "", sideEffects: reply.sideEffects };
+        return await sendWithMainWorld(tabId, prompt);
       } catch (e) {
         // One re-inject if the page navigated mid-run.
         const msg = e instanceof Error ? e.message : String(e);
         if (/Receiving end does not exist|message port closed|unreachable/i.test(msg)) {
           ready = false;
           await ensureReady();
-          const reply = await sendToTab(tabId, { type: "mirage:send", prompt });
-          if (!reply.ok) throw new Error(reply.error || "tab target failed to respond");
-          return { response: reply.response ?? "", sideEffects: reply.sideEffects };
+          return await sendWithMainWorld(tabId, prompt);
         }
         throw e;
       }
@@ -152,6 +165,159 @@ function makeBrowserTools(tabId: number, ensureReady: () => Promise<void>): Brow
       return { clicked: !!reply.clicked, label: reply.clickedLabel };
     },
   };
+}
+
+/**
+ * Fill + submit in the page's MAIN JS world (so jQuery / window.submitMessage
+ * see the value), then wait for the assistant bubble via the content script.
+ *
+ * Isolated-world content scripts share the DOM but NOT page JS — setting
+ * textarea.value works, but sites that only honor their own handlers
+ * (promptairlines.com → $('#chatInput').val() + submitMessage()) need MAIN.
+ */
+async function sendWithMainWorld(tabId: number, prompt: string): Promise<TargetResponse> {
+  // 1) Snapshot from isolated content script (DOM read is fine either world).
+  const prep = await sendToTab(tabId, { type: "mirage:prepare" });
+  if (!prep.ok) {
+    // Fall back to legacy all-in-content-script path.
+    const reply = await sendToTab(tabId, { type: "mirage:send", prompt });
+    if (!reply.ok) throw new Error(reply.error || "tab target failed to respond");
+    return { response: reply.response ?? "", sideEffects: reply.sideEffects };
+  }
+
+  // 2) Type + submit inside the real page context.
+  const submitted = await submitInPageMainWorld(tabId, prompt);
+  if (!submitted.ok) {
+    // Retry full content-script path (generic sites / no globals).
+    const reply = await sendToTab(tabId, { type: "mirage:send", prompt });
+    if (!reply.ok) {
+      throw new Error(submitted.error || reply.error || "failed to submit prompt into page");
+    }
+    return { response: reply.response ?? "", sideEffects: reply.sideEffects };
+  }
+
+  // 3) Wait for a new assistant reply in the chat panel.
+  const reply = await sendToTab(tabId, {
+    type: "mirage:await",
+    prompt,
+    beforeAssistant: prep.beforeAssistant ?? [],
+    beforeBlob: prep.beforeBlob ?? "",
+  });
+  if (!reply.ok) throw new Error(reply.error || "tab target failed to respond");
+  return { response: reply.response ?? "", sideEffects: reply.sideEffects };
+}
+
+/** Runs in the page MAIN world — must stay self-contained (no imports). */
+function submitInPageMainWorld(
+  tabId: number,
+  prompt: string,
+): Promise<{ ok: boolean; error?: string }> {
+  return chrome.scripting
+    .executeScript({
+      target: { tabId },
+      world: "MAIN",
+      args: [prompt],
+      func: (text: string) => {
+        try {
+          const chatTab = document.getElementById("chat-tab-btn") as HTMLElement | null;
+          if (chatTab) chatTab.click();
+
+          // Prefer known chat composers, then first visible textarea.
+          const byId = (id: string) => document.getElementById(id) as HTMLElement | null;
+          const input =
+            byId("chatInput") ||
+            byId("chat-input") ||
+            byId("message-input") ||
+            byId("prompt-input") ||
+            (document.querySelector(
+              'textarea, [contenteditable="true"]',
+            ) as HTMLElement | null);
+          if (!input) return { ok: false, error: "MAIN world: no composer found" };
+
+          const w = window as unknown as {
+            jQuery?: (x: string | Element) => {
+              val: (v?: string) => unknown;
+              trigger: (e: string) => unknown;
+            };
+            $?: (x: string | Element) => {
+              val: (v?: string) => unknown;
+              trigger: (e: string) => unknown;
+            };
+            submitMessage?: () => unknown;
+          };
+          const $ = w.jQuery || w.$;
+
+          if (input.isContentEditable) {
+            input.textContent = text;
+            input.dispatchEvent(new InputEvent("input", { bubbles: true, data: text }));
+          } else {
+            const field = input as HTMLInputElement | HTMLTextAreaElement;
+            const proto =
+              field instanceof HTMLTextAreaElement
+                ? HTMLTextAreaElement.prototype
+                : HTMLInputElement.prototype;
+            const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+            setter ? setter.call(field, text) : (field.value = text);
+            if ($) {
+              $(field).val(text);
+              $(field).trigger("input");
+              $(field).trigger("change");
+            }
+            field.dispatchEvent(new Event("input", { bubbles: true }));
+            field.dispatchEvent(new Event("change", { bubbles: true }));
+          }
+
+          // promptairlines: global submitMessage() reads $('#chatInput').val()
+          if (typeof w.submitMessage === "function") {
+            void Promise.resolve(w.submitMessage());
+            return { ok: true };
+          }
+
+          const btn =
+            byId("sendMessageBtn") ||
+            byId("send-button") ||
+            byId("send-btn") ||
+            (document.querySelector(
+              'button.send-button, button[type="submit"], [aria-label*="Send" i]',
+            ) as HTMLElement | null);
+          if (btn) {
+            btn.click();
+            return { ok: true };
+          }
+
+          // Enter on document (some labs bind document keypress, not the input).
+          document.dispatchEvent(
+            new KeyboardEvent("keypress", {
+              key: "Enter",
+              code: "Enter",
+              keyCode: 13,
+              which: 13,
+              bubbles: true,
+            }),
+          );
+          input.dispatchEvent(
+            new KeyboardEvent("keydown", {
+              key: "Enter",
+              code: "Enter",
+              keyCode: 13,
+              which: 13,
+              bubbles: true,
+            }),
+          );
+          return { ok: true };
+        } catch (e) {
+          return { ok: false, error: e instanceof Error ? e.message : String(e) };
+        }
+      },
+    })
+    .then((results) => {
+      const r = results[0]?.result as { ok: boolean; error?: string } | undefined;
+      return r ?? { ok: false, error: "MAIN world inject returned no result" };
+    })
+    .catch((e: unknown) => ({
+      ok: false,
+      error: e instanceof Error ? e.message : String(e),
+    }));
 }
 
 function isBlockedUrl(url: string): boolean {
