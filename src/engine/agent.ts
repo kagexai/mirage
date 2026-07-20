@@ -1,16 +1,24 @@
 import {
   askAgent,
-  buildAgentMessages,
+  kickoffMessage,
+  paceProfile,
+  serializeDecision,
   shouldStopOnFirstWin,
+  windowConversation,
   type MemoryEntry,
 } from "@/src/agents/redteam-agent";
-import { CONTINUE_PROMPT, looksTruncated, mergeContinued } from "@/src/agents/strategy";
+import {
+  CONTINUE_PROMPT,
+  looksTruncated,
+  mergeContinued,
+  strategyHints,
+} from "@/src/agents/strategy";
 import { judgeGoal, shouldJudgeGoal } from "@/src/agents/goal-judge";
 import { confirmProbe } from "@/src/scoring/confirm";
 import { owaspForCategory, type Severity } from "@/src/taxonomy/categories";
-import type { Provider } from "@/src/providers/types";
+import type { ChatMessage, Provider } from "@/src/providers/types";
 import type { Target } from "@/src/targets/types";
-import type { EngineEvent, Finding, ProbeLog, RunState, StepResult } from "./run";
+import type { Capture, EngineEvent, Finding, ProbeLog, RunState, StepResult } from "./run";
 import { isFatalTabError } from "@/src/targets/tab";
 
 const MAX_AUTO_CONTINUES = 2;
@@ -43,6 +51,7 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
   const { config, target, brain, emit, signal } = deps;
   const pace = config.pace ?? "balanced";
   const stopOnWin = shouldStopOnFirstWin(config);
+  const hasBrowser = !!target.browser;
 
   const state: RunState = {
     id: newId(),
@@ -51,21 +60,49 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
     startedAt: Date.now(),
     findings: [],
     transcript: [],
+    screenshots: [],
+    activity: [],
     total: config.maxIterations,
     completed: 0,
     wins: 0,
   };
   emit({ type: "run:start", state });
 
+  // `memory` is structured bookkeeping (drives strategy hints + record lookup).
+  // `conversation` is the live ReAct transcript sent to the brain each turn: its
+  // own decisions (assistant turns) and the observations after each action (user
+  // turns) accumulate as real turns instead of a flat blob re-rendered each time.
   const memory: MemoryEntry[] = [];
+  const profile = paceProfile(pace);
+  const conversation: ChatMessage[] = [
+    { role: "user", content: kickoffMessage(config, target.label, hasBrowser) },
+  ];
+  // Record an observation turn so the next iteration sees the result of this one.
+  const observe = (text: string) => conversation.push({ role: "user", content: text });
   target.reset();
 
-  for (let iteration = 1; iteration <= config.maxIterations; iteration++) {
+  // Free recon: read the page once up front (no brain call) so the agent starts
+  // with page context and spends its budget attacking, not looking around.
+  if (target.browser) {
+    await autoRecon(target, state, conversation, emit, signal);
+  }
+
+  // The budget counts ATTACKS (probes), not navigation. Browser tools are free
+  // but capped so the agent can't burn a run scrolling. `iteration` numbers the
+  // attacks contiguously (1..N); a hard step cap prevents a probe-less runaway.
+  let iteration = 0; // attacks fired so far
+  let steps = 0; // total loop turns (safety bound)
+  let reconStreak = 0; // consecutive non-probe actions
+  const HARD_CAP = config.maxIterations * 3 + 12;
+  const MAX_RECON_STREAK = 3;
+
+  while (iteration < config.maxIterations && steps < HARD_CAP) {
     if (signal.aborted) break;
+    steps++;
 
     let decision;
     try {
-      const messages = buildAgentMessages(memory, config, iteration, target.label);
+      const messages = windowConversation(conversation, profile.memoryLimit * 2);
       decision = await askAgent(brain, messages, signal, pace);
     } catch (e) {
       if (signal.aborted || isAbortError(e)) break;
@@ -76,7 +113,7 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
         try {
           await delay(600);
           if (signal.aborted) break;
-          const messages = buildAgentMessages(memory, config, iteration, target.label);
+          const messages = windowConversation(conversation, profile.memoryLimit * 2);
           decision = await askAgent(brain, messages, signal, pace);
         } catch (e2) {
           if (signal.aborted || isAbortError(e2)) break;
@@ -98,6 +135,10 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
       }
     }
 
+    // Echo the chosen action back as the assistant turn so the transcript is a
+    // faithful Thought → Action → Observation record.
+    conversation.push({ role: "assistant", content: serializeDecision(decision) });
+
     emit({ type: "agent", iteration, phase: decision.phase, thought: decision.thought });
     if (pace === "thorough") {
       memory.push({
@@ -113,8 +154,68 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
       break;
     }
 
+    if (decision.action.type === "browser") {
+      const a = decision.action;
+      let browserObs = `${a.tool}: done`;
+      if (!target.browser) {
+        memory.push({ kind: "note", iteration, note: "browser tools unavailable on this target" });
+        emit({ type: "log", level: "warn", message: "browser tool requested but target has no page controls" });
+        browserObs = `${a.tool} unavailable — this target has no page controls; use probes instead`;
+      } else {
+        try {
+          if (a.tool === "read_page") {
+            const snap = await target.browser.readPage();
+            const detail =
+              `${snap.title || snap.url} — composer:${snap.composerFound} msgs:${snap.messageCount} ` +
+              `buttons:[${snap.buttons.slice(0, 8).join(", ")}] text:"${clipText(snap.textPreview, 320)}"`;
+            memory.push({ kind: "note", iteration, note: `READ_PAGE → ${detail}` });
+            emit({ type: "browser", iteration, tool: "read_page", detail });
+            browserObs = `read_page → ${detail}`;
+          } else if (a.tool === "scroll") {
+            const dir = a.direction ?? "down";
+            await target.browser.scroll(dir);
+            memory.push({ kind: "note", iteration, note: `scrolled ${dir}` });
+            emit({ type: "browser", iteration, tool: "scroll", detail: dir });
+            browserObs = `scrolled ${dir}`;
+          } else if (a.tool === "click") {
+            const res = await target.browser.click({ selector: a.selector, text: a.text });
+            const detail = res.clicked
+              ? `clicked "${res.label ?? a.text ?? a.selector ?? ""}"`
+              : `no element matched (${a.text ?? a.selector ?? "?"})`;
+            memory.push({ kind: "note", iteration, note: detail });
+            emit({ type: "browser", iteration, tool: "click", detail });
+            browserObs = detail;
+          } else if (a.tool === "screenshot") {
+            const dataUrl = await target.browser.screenshot();
+            const caption = a.objective || "manual capture";
+            state.screenshots.push({ iteration, caption, dataUrl });
+            emit({ type: "screenshot", iteration, caption, dataUrl });
+            memory.push({ kind: "note", iteration, note: "captured a screenshot of the page" });
+            browserObs = "captured a screenshot of the page";
+          }
+        } catch (e) {
+          if (signal.aborted || isAbortError(e)) break;
+          const bmsg = e instanceof Error ? e.message : String(e);
+          emit({ type: "log", level: "warn", message: `browser ${a.tool} failed: ${bmsg}` });
+          browserObs = `${a.tool} failed: ${bmsg}`;
+        }
+      }
+      // Navigation is recon, not an attack — record it separately and DON'T
+      // touch the attack budget. Nudge the agent if it keeps stalling.
+      if (target.browser) state.activity.push({ tool: a.tool, detail: browserObs });
+      reconStreak++;
+      const nudge =
+        reconStreak >= MAX_RECON_STREAK
+          ? `\n(You've run ${reconStreak} recon steps with no attack — send a probe now.)`
+          : "";
+      observe(`RECON ${browserObs}${nudge}`);
+      emit({ type: "run:progress", completed: iteration, total: state.total, wins: state.wins });
+    }
+
     if (decision.action.type === "probe") {
       const a = decision.action;
+      iteration++; // this probe is attack #iteration; navigation never bumps it
+      reconStreak = 0;
       if (a.newConversation) {
         target.reset();
         memory.push({ kind: "note", iteration, note: "started a fresh target conversation" });
@@ -194,6 +295,7 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
           outcome: "error",
           markersHit: [],
         });
+        observe(`OBSERVATION #${iteration} [error] probe failed: ${message}`);
         state.completed = iteration;
         emit({ type: "run:progress", completed: iteration, total: state.total, wins: state.wins });
 
@@ -234,6 +336,9 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
       };
       state.transcript.push(probe);
       emit({ type: "probe", probe });
+      // Count the attack as soon as it's logged, so a stop during the goal-judge
+      // still reflects it (completed tracks attacks fired, not loop-turn ends).
+      state.completed = iteration;
 
       memory.push({
         kind: "probe",
@@ -244,6 +349,15 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
         outcome,
         markersHit: conf.markersHit,
       });
+
+      // Feed the outcome + adaptive strategy hints back as the next observation.
+      const hints = strategyHints(memory);
+      observe(
+        `OBSERVATION #${iteration} [${outcome}` +
+          (conf.markersHit.length ? ` matched:${conf.markersHit.join("|")}` : "") +
+          `] target replied: ${clipText(response, profile.responseChars)}` +
+          (hints.length ? `\nHINTS: ${hints.join(" | ")}` : ""),
+      );
 
       // Operator scope = WIN CONDITION. Only spend a goal-judge LLM call when
       // the gate says it's worth it.
@@ -276,6 +390,7 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
               thought: decision.thought,
               step: { iteration, objective: scope, prompt: a.prompt, response, sideEffects },
             });
+            finding.screenshot = await captureWin(target, state, iteration, `objective: ${scope}`, emit);
             state.findings.push(finding);
             state.wins++;
             emit({ type: "agent", iteration, phase: "done", thought: `Objective achieved — ${goal.evidence}` });
@@ -300,6 +415,7 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
           thought: decision.thought,
           step: { iteration, objective: a.objective, prompt: a.prompt, response, sideEffects },
         });
+        finding.screenshot = await captureWin(target, state, iteration, `win: ${finding.category}`, emit);
         state.findings.push(finding);
         state.wins++;
         emit({ type: "finding", finding });
@@ -355,6 +471,9 @@ export async function runAgent(deps: AgentDeps): Promise<RunState> {
       state.findings.push(finding);
       if (confirmed) state.wins++;
       emit({ type: "finding", finding });
+      observe(
+        `OBSERVATION #${iteration} recorded ${confirmed ? "(CONFIRMED)" : "(unconfirmed — no deterministic marker)"}: ${a.evidence || a.objective}`,
+      );
 
       if (confirmed && stopOnWin) {
         state.completed = iteration;
@@ -393,6 +512,59 @@ function isRefusalLike(text: string): boolean {
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function clipText(s: string, n: number): string {
+  return s.length <= n ? s : `${s.slice(0, n)}…`;
+}
+
+// Free recon before the loop: read the page once (no brain call) and seed the
+// snapshot into the conversation so the agent opens with page context and spends
+// its budget attacking. Non-fatal — a failure just skips the head start.
+async function autoRecon(
+  target: Target,
+  state: RunState,
+  conversation: ChatMessage[],
+  emit: (event: EngineEvent) => void,
+  signal: AbortSignal,
+): Promise<void> {
+  if (!target.browser) return;
+  try {
+    const snap = await target.browser.readPage();
+    if (signal.aborted) return;
+    const detail =
+      `${snap.title || snap.url} — composer:${snap.composerFound} msgs:${snap.messageCount} ` +
+      `buttons:[${snap.buttons.slice(0, 8).join(", ")}] text:"${clipText(snap.textPreview, 320)}"`;
+    state.activity.push({ tool: "read_page", detail });
+    emit({ type: "browser", iteration: 0, tool: "read_page", detail });
+    conversation.push({
+      role: "user",
+      content: `RECON (auto) read_page → ${detail}\nThe page is already loaded. Plan and launch your first attack.`,
+    });
+  } catch (e) {
+    if (isAbortError(e)) return;
+    emit({ type: "log", level: "info", message: `auto-recon skipped: ${e instanceof Error ? e.message : e}` });
+  }
+}
+
+// Capture a screenshot of the target page as evidence for a confirmed win.
+// Non-fatal: a capture failure never blocks the finding.
+async function captureWin(
+  target: Target,
+  state: RunState,
+  iteration: number,
+  caption: string,
+  emit: (event: EngineEvent) => void,
+): Promise<string | undefined> {
+  if (!target.browser) return undefined;
+  try {
+    const dataUrl = await target.browser.screenshot();
+    state.screenshots.push({ iteration, caption, dataUrl });
+    emit({ type: "screenshot", iteration, caption, dataUrl });
+    return dataUrl;
+  } catch {
+    return undefined;
+  }
 }
 
 function makeFinding(args: {

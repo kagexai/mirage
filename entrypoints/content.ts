@@ -1,5 +1,13 @@
 import { defineContentScript } from "wxt/sandbox";
 import type { TabMessage, TabReply } from "@/src/targets/tab";
+import {
+  extractReplyFromTranscript,
+  isLabelOnly,
+  isTypingNoise,
+  normalizeWs,
+  stripEchoAndNoise,
+  stripLeadingSpeaker,
+} from "@/src/targets/reply";
 
 // Live-tab adapter. Best-effort across arbitrary chat UIs: locate the composer,
 // type the payload like a user, submit, wait for a REAL assistant reply (not the
@@ -24,11 +32,104 @@ export default defineContentScript({
           );
           return true; // async reply
         }
+        if (msg.type === "mirage:scroll") {
+          doScroll(msg.direction);
+          sendReply({ ok: true });
+          return false;
+        }
+        if (msg.type === "mirage:read") {
+          sendReply({ ok: true, snapshot: readSnapshot() });
+          return false;
+        }
+        if (msg.type === "mirage:click") {
+          const r = doClick(msg.selector, msg.text);
+          sendReply({ ok: true, clicked: r.clicked, clickedLabel: r.label });
+          return false;
+        }
         return false;
       },
     );
   },
 });
+
+// ── Browser controls (scroll / read / click) ──────────────────────────────────
+
+function doScroll(direction: "up" | "down" | "top" | "bottom"): void {
+  const root = findChatRoot();
+  const winStep = Math.round(window.innerHeight * 0.9);
+  const rootStep = Math.round((root.clientHeight || winStep) * 0.9);
+  switch (direction) {
+    case "top":
+      window.scrollTo({ top: 0 });
+      root.scrollTop = 0;
+      break;
+    case "bottom":
+      window.scrollTo({ top: document.body.scrollHeight });
+      root.scrollTop = root.scrollHeight;
+      break;
+    case "up":
+      window.scrollBy({ top: -winStep });
+      root.scrollTop -= rootStep;
+      break;
+    case "down":
+      window.scrollBy({ top: winStep });
+      root.scrollTop += rootStep;
+      break;
+  }
+}
+
+function readSnapshot() {
+  const root = findChatRoot();
+  const buttons = [...document.querySelectorAll<HTMLElement>('button, [role="button"], input[type="submit"]')]
+    .filter(isVisible)
+    .map((b) => normalizeWs(b.getAttribute("aria-label") || b.textContent || (b as HTMLInputElement).value || ""))
+    .filter((t) => t.length > 0 && t.length < 40);
+  const headings = [...document.querySelectorAll<HTMLElement>("h1, h2, h3")]
+    .map((h) => normalizeWs(h.textContent || ""))
+    .filter(Boolean);
+  const text = normalizeWs(root.innerText || document.body.innerText || "");
+  return {
+    url: location.href,
+    title: document.title,
+    composerFound: !!findComposer(),
+    buttons: dedup(buttons).slice(0, 24),
+    headings: dedup(headings).slice(0, 12),
+    textPreview: text.slice(0, 1600),
+    messageCount: messageCandidates(root).length,
+  };
+}
+
+function doClick(selector?: string, text?: string): { clicked: boolean; label?: string } {
+  let el: HTMLElement | null = null;
+  if (selector) {
+    try {
+      el = document.querySelector<HTMLElement>(selector);
+    } catch {
+      el = null;
+    }
+  }
+  if (!el && text) {
+    const want = text.toLowerCase();
+    const clickables = [
+      ...document.querySelectorAll<HTMLElement>('button, a, [role="button"], input[type="submit"], [onclick]'),
+    ].filter(isVisible);
+    el =
+      clickables.find((c) => {
+        const label = `${c.getAttribute("aria-label") ?? ""} ${c.textContent ?? ""} ${c.getAttribute("title") ?? ""}`.toLowerCase();
+        return label.includes(want);
+      }) ?? null;
+  }
+  if (el && isVisible(el)) {
+    const label = normalizeWs(el.getAttribute("aria-label") || el.textContent || "").slice(0, 60);
+    el.click();
+    return { clicked: true, label };
+  }
+  return { clicked: false };
+}
+
+function dedup(arr: string[]): string[] {
+  return [...new Set(arr)];
+}
 
 async function handleSend(prompt: string): Promise<TabReply> {
   const input = findComposer();
@@ -151,44 +252,6 @@ function findSendButton(input: HTMLElement): HTMLElement | null {
 
 // ── Assistant reply extraction ────────────────────────────────────────────────
 
-const TYPING_RE =
-  /^(?:[\w.-]+\s+)?(?:is\s+)?typing\.{0,3}$|^\s*(?:thinking|generating|loading|please wait)\.{0,3}\s*$|^\s*\.{2,}\s*$/i;
-
-function isTypingNoise(text: string): boolean {
-  const t = text.replace(/\s+/g, " ").trim();
-  if (!t) return true;
-  if (TYPING_RE.test(t)) return true;
-  if (/is typing/i.test(t) && t.length < 80) return true;
-  return false;
-}
-
-function normalizeWs(s: string): string {
-  return s.replace(/\s+/g, " ").trim();
-}
-
-/** Remove the reflected user prompt and typing chrome from a text blob. */
-export function stripEchoAndNoise(blob: string, prompt: string): string {
-  let t = blob;
-  const p = prompt.trim();
-  if (p.length >= 8) {
-    // Exact and whitespace-normalized removals.
-    t = t.split(p).join("\n");
-    const pNorm = normalizeWs(p);
-    const tNorm = normalizeWs(t);
-    if (tNorm.includes(pNorm)) {
-      t = tNorm.split(pNorm).join("\n");
-    }
-  }
-  // Drop typing-indicator lines.
-  t = t
-    .split("\n")
-    .filter((line) => !isTypingNoise(line))
-    .join("\n");
-  // Collapse leftover "Julia is typing..." fragments mid-string.
-  t = t.replace(/\b[\w.-]+\s+is typing\.{0,3}/gi, " ");
-  return t.replace(/\n{3,}/g, "\n\n").trim();
-}
-
 interface MsgNode {
   role: "user" | "assistant" | "unknown";
   text: string;
@@ -307,9 +370,11 @@ async function waitForAssistantReply(
       if (m.role === "user") return false;
       const n = normalizeWs(m.text);
       if (!n || isTypingNoise(n)) return false;
+      // A bare speaker label ("USER@ECORP:", "MOBLEY:") is not a reply.
+      if (isLabelOnly(n)) return false;
       if (beforeSet.has(n)) return false;
       // Skip pure echoes of our prompt.
-      if (n === promptNorm || promptNorm.includes(n) && n.length < promptNorm.length * 1.05) {
+      if (n === promptNorm || (promptNorm.includes(n) && n.length < promptNorm.length * 1.05)) {
         return false;
       }
       if (n.startsWith(promptNorm) && stripEchoAndNoise(n, prompt).length < 12) return false;
@@ -321,25 +386,35 @@ async function waitForAssistantReply(
       // Prefer last assistant-labeled; else last fresh unknown after strip.
       const assistants = fresh.filter((m) => m.role === "assistant");
       const pick = (assistants.length ? assistants : fresh)[assistants.length ? assistants.length - 1 : fresh.length - 1]!;
-      candidate = stripEchoAndNoise(pick.text, prompt);
+      candidate = stripLeadingSpeaker(stripEchoAndNoise(pick.text, prompt));
       // If multiple new assistant chunks streamed as separate nodes, join recent ones.
       if (assistants.length > 1) {
         const joined = assistants
-          .map((m) => stripEchoAndNoise(m.text, prompt))
+          .map((m) => stripLeadingSpeaker(stripEchoAndNoise(m.text, prompt)))
           .filter(Boolean)
           .join("\n");
         if (joined.length > candidate.length) candidate = joined;
       }
     }
 
-    // 2) Fallback: text diff of chat root, strip echo + typing.
-    if (!candidate || candidate.length < 8) {
+    // 2) Speaker-aware: parse the full transcript into "SPEAKER: text" turns and
+    // take what came after our prompt echo. Robust on multi-agent lab/CTF pages
+    // where structured nodes are just labels (e.g. SentinelGoat's MOBLEY panel).
+    if (!candidate || candidate.length < 8 || isLabelOnly(candidate)) {
+      const fromTurns = extractReplyFromTranscript(root.innerText ?? "", prompt);
+      if (fromTurns.length >= 2 && !beforeSet.has(normalizeWs(fromTurns))) {
+        candidate = fromTurns;
+      }
+    }
+
+    // 3) Fallback: text diff of chat root, strip echo + typing + leading label.
+    if (!candidate || candidate.length < 8 || isLabelOnly(candidate)) {
       const added = diffTail(beforeBlob, root.innerText ?? "");
-      candidate = stripEchoAndNoise(added, prompt);
+      candidate = stripLeadingSpeaker(stripEchoAndNoise(added, prompt));
     }
 
     // Still only noise?
-    if (!candidate || isTypingNoise(candidate) || normalizeWs(candidate) === promptNorm) {
+    if (!candidate || isTypingNoise(candidate) || isLabelOnly(candidate) || normalizeWs(candidate) === promptNorm) {
       if (!sawReal && Date.now() - start >= NO_REPLY_BAILOUT) {
         return ""; // nothing real arrived
       }
