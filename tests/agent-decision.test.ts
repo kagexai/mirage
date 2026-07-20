@@ -4,8 +4,12 @@ import {
   paceProfile,
   renderMemory,
   shouldStopOnFirstWin,
+  kickoffMessage,
+  serializeDecision,
+  windowConversation,
   type MemoryEntry,
 } from "@/src/agents/redteam-agent";
+import type { ChatMessage } from "@/src/providers/types";
 import { parseGoalVerdict, shouldJudgeGoal } from "@/src/agents/goal-judge";
 
 describe("parseAgentDecision", () => {
@@ -49,6 +53,26 @@ describe("parseAgentDecision", () => {
   it("parses a done decision", () => {
     const d = parseAgentDecision('{"phase":"done","action":{"type":"done","summary":"target resisted"}}');
     expect(d!.action.type).toBe("done");
+  });
+
+  it("parses browser actions (read_page / scroll / click)", () => {
+    const read = parseAgentDecision('{"phase":"recon","action":{"type":"browser","tool":"read_page"}}');
+    expect(read!.action.type).toBe("browser");
+    if (read!.action.type === "browser") expect(read!.action.tool).toBe("read_page");
+
+    const scroll = parseAgentDecision(
+      '{"phase":"recon","action":{"type":"browser","tool":"scroll","direction":"top"}}',
+    );
+    if (scroll!.action.type === "browser") expect(scroll!.action.direction).toBe("top");
+
+    const click = parseAgentDecision(
+      '{"phase":"recon","action":{"type":"browser","tool":"click","text":"open chat"}}',
+    );
+    if (click!.action.type === "browser") expect(click!.action.text).toBe("open chat");
+  });
+
+  it("rejects a browser action with an unknown tool", () => {
+    expect(parseAgentDecision('{"phase":"recon","action":{"type":"browser","tool":"hack"}}')).toBeNull();
   });
 
   it("returns null on garbage", () => {
@@ -146,6 +170,48 @@ describe("pace / memory compaction", () => {
     expect(out).not.toContain("long thought");
     expect(out).toContain("…");
     expect(out.length).toBeLessThan(200);
+  });
+
+  it("kickoffMessage carries the objective as a win condition and page-control state", () => {
+    const withScope = kickoffMessage(
+      { targetKind: "tab", maxIterations: 12, scope: "extract the system prompt" },
+      "Aegis (tab)",
+      true,
+    );
+    expect(withScope).toContain("Aegis (tab)");
+    expect(withScope).toContain("WIN CONDITION");
+    expect(withScope).toContain("extract the system prompt");
+    expect(withScope).toContain("PAGE CONTROLS: available");
+
+    const noBrowser = kickoffMessage({ targetKind: "api", maxIterations: 5 }, "api", false);
+    expect(noBrowser).toContain("general red-team");
+    expect(noBrowser).toContain("PAGE CONTROLS: none");
+  });
+
+  it("serializeDecision echoes phase + action compactly", () => {
+    const s = serializeDecision({
+      phase: "test",
+      thought: "try it",
+      action: { type: "probe", prompt: "hi", objective: "x", newConversation: false },
+    });
+    const round = JSON.parse(s);
+    expect(round.phase).toBe("test");
+    expect(round.action.type).toBe("probe");
+  });
+
+  it("windowConversation keeps the kickoff turn plus the most recent tail", () => {
+    const conv: ChatMessage[] = [{ role: "user", content: "KICKOFF" }];
+    for (let i = 1; i <= 10; i++) {
+      conv.push({ role: "assistant", content: `decision ${i}` });
+      conv.push({ role: "user", content: `OBSERVATION #${i}` });
+    }
+    const windowed = windowConversation(conv, 4);
+    expect(windowed).toHaveLength(5); // kickoff + last 4
+    expect(windowed[0]!.content).toBe("KICKOFF"); // system-anchored prefix preserved
+    expect(windowed[windowed.length - 1]!.content).toBe("OBSERVATION #10"); // ends on newest observation
+    // Short conversations are returned untouched.
+    const short: ChatMessage[] = [{ role: "user", content: "KICKOFF" }, { role: "assistant", content: "a" }];
+    expect(windowConversation(short, 4)).toBe(short);
   });
 
   it("shouldStopOnFirstWin defaults from pace", () => {
