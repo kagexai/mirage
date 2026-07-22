@@ -1,6 +1,14 @@
 import { defineContentScript } from "wxt/sandbox";
 import type { TabMessage, TabReply } from "@/src/targets/tab";
 import { findBestComposer, isPageChromeNoise } from "@/src/targets/composer";
+import {
+  extractReplyFromTranscript,
+  isLabelOnly,
+  isTypingNoise,
+  normalizeWs,
+  stripEchoAndNoise,
+  stripLeadingSpeaker,
+} from "@/src/targets/reply";
 
 // Live-tab adapter. Best-effort across arbitrary chat UIs: locate the composer,
 // type the payload like a user, submit, wait for a REAL assistant reply (not the
@@ -299,44 +307,9 @@ function findSendButton(input: HTMLElement): HTMLElement | null {
 }
 
 // ── Assistant reply extraction ────────────────────────────────────────────────
-
-const TYPING_RE =
-  /^(?:[\w.-]+\s+)?(?:is\s+)?typing\.{0,3}$|^\s*(?:thinking|generating|loading|please wait)\.{0,3}\s*$|^\s*\.{2,}\s*$/i;
-
-function isTypingNoise(text: string): boolean {
-  const t = text.replace(/\s+/g, " ").trim();
-  if (!t) return true;
-  if (TYPING_RE.test(t)) return true;
-  if (/is typing/i.test(t) && t.length < 80) return true;
-  return false;
-}
-
-function normalizeWs(s: string): string {
-  return s.replace(/\s+/g, " ").trim();
-}
-
-/** Remove the reflected user prompt and typing chrome from a text blob. */
-export function stripEchoAndNoise(blob: string, prompt: string): string {
-  let t = blob;
-  const p = prompt.trim();
-  if (p.length >= 8) {
-    // Exact and whitespace-normalized removals.
-    t = t.split(p).join("\n");
-    const pNorm = normalizeWs(p);
-    const tNorm = normalizeWs(t);
-    if (tNorm.includes(pNorm)) {
-      t = tNorm.split(pNorm).join("\n");
-    }
-  }
-  // Drop typing-indicator lines.
-  t = t
-    .split("\n")
-    .filter((line) => !isTypingNoise(line))
-    .join("\n");
-  // Collapse leftover "Julia is typing..." fragments mid-string.
-  t = t.replace(/\b[\w.-]+\s+is typing\.{0,3}/gi, " ");
-  return t.replace(/\n{3,}/g, "\n\n").trim();
-}
+// Pure text helpers (stripEchoAndNoise / normalizeWs / isTypingNoise /
+// isLabelOnly / extractReplyFromTranscript) live in src/targets/reply.ts so they
+// are unit-testable without the DOM.
 
 interface MsgNode {
   role: "user" | "assistant" | "unknown";
@@ -467,6 +440,8 @@ async function waitForAssistantReply(
         if (m.role === "user") return false;
         const n = normalizeWs(m.text);
         if (!n || isTypingNoise(n) || isPageChromeNoise(n)) return false;
+        // A bare speaker label ("USER@ECORP:", "MOBLEY:") is not a reply.
+        if (isLabelOnly(n)) return false;
         if (beforeSet.has(n)) return false;
         // Skip pure echoes of our prompt.
         if (n === promptNorm || (promptNorm.includes(n) && n.length < promptNorm.length * 1.05)) {
@@ -481,10 +456,10 @@ async function waitForAssistantReply(
         const pick = (assistants.length ? assistants : fresh)[
           assistants.length ? assistants.length - 1 : fresh.length - 1
         ]!;
-        candidate = stripEchoAndNoise(pick.text, prompt);
+        candidate = stripLeadingSpeaker(stripEchoAndNoise(pick.text, prompt));
         if (assistants.length > 1) {
           const joined = assistants
-            .map((m) => stripEchoAndNoise(m.text, prompt))
+            .map((m) => stripLeadingSpeaker(stripEchoAndNoise(m.text, prompt)))
             .filter(Boolean)
             .join("\n");
           if (joined.length > candidate.length) candidate = joined;
@@ -492,10 +467,20 @@ async function waitForAssistantReply(
       }
     }
 
+    // 1.5) Speaker-aware: parse the full transcript into "SPEAKER: text" turns and
+    // take what came after our prompt echo. Robust on multi-agent lab/CTF pages
+    // where structured nodes are just labels (e.g. SentinelGoat's MOBLEY panel).
+    if (!candidate || candidate.length < 8 || isLabelOnly(candidate)) {
+      const fromTurns = extractReplyFromTranscript(root.innerText ?? "", prompt);
+      if (fromTurns.length >= 2 && !beforeSet.has(normalizeWs(fromTurns))) {
+        candidate = fromTurns;
+      }
+    }
+
     // 2) Fallback: text diff of chat root ONLY (never document.body — pure chrome).
-    if ((!candidate || candidate.length < 8) && root !== document.body) {
+    if ((!candidate || candidate.length < 8 || isLabelOnly(candidate)) && root !== document.body) {
       const added = diffTail(beforeBlob, root.innerText ?? "");
-      candidate = stripEchoAndNoise(added, prompt);
+      candidate = stripLeadingSpeaker(stripEchoAndNoise(added, prompt));
     }
 
     // Still only noise / page chrome?
@@ -503,6 +488,7 @@ async function waitForAssistantReply(
       !candidate ||
       isTypingNoise(candidate) ||
       isPageChromeNoise(candidate) ||
+      isLabelOnly(candidate) ||
       normalizeWs(candidate) === promptNorm
     ) {
       stableFor = 0;

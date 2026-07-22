@@ -49,7 +49,24 @@ export interface Finding {
   phase: AgentPhase;
   thought: string;
   steps: StepResult[];
+  // Visual evidence: a screenshot of the target page captured when the win was
+  // confirmed (tab target only). Data URL.
+  screenshot?: string;
   error?: string;
+}
+
+// A captured screenshot of the target page (tab target). Evidence + report.
+export interface Capture {
+  iteration: number;
+  caption: string;
+  dataUrl: string;
+}
+
+// A recon / navigation step (read_page, scroll, click, screenshot). These do NOT
+// consume the attack budget — they are shown separately from numbered attacks.
+export interface ActivityEntry {
+  tool: string;
+  detail: string;
 }
 
 export type RunStatus = "idle" | "running" | "done" | "stopped" | "error";
@@ -81,7 +98,12 @@ export interface RunState {
   findings: Finding[];
   // Every probe prompt/response (wins and misses). Source of truth for reports.
   transcript: ProbeLog[];
-  // Progress counters for the UI (total = maxIterations).
+  // Screenshots captured during the run (win evidence + agent-initiated).
+  screenshots: Capture[];
+  // Recon / navigation steps (do not count as attacks).
+  activity: ActivityEntry[];
+  // Progress counters for the UI. total = attack budget (maxIterations);
+  // completed = attacks actually fired (probes), not navigation steps.
   total: number;
   completed: number;
   wins: number;
@@ -94,6 +116,8 @@ export type EngineEvent =
   | { type: "run:progress"; completed: number; total: number; wins: number }
   | { type: "agent"; iteration: number; phase: AgentPhase; thought: string }
   | { type: "probe"; probe: ProbeLog }
+  | { type: "browser"; iteration: number; tool: string; detail: string }
+  | { type: "screenshot"; iteration: number; caption: string; dataUrl: string }
   | { type: "finding"; finding: Finding }
   | { type: "log"; level: "info" | "warn" | "error"; message: string }
   | { type: "run:done"; state: RunState }

@@ -33,6 +33,168 @@ function vulnerableTarget(): Target {
   };
 }
 
+// A tab-like target exposing browser controls, for the browser-tools path.
+function browserTarget(): Target {
+  return {
+    kind: "tab",
+    label: "tab-stub",
+    async send(prompt: string): Promise<TargetResponse> {
+      const m = prompt.match(/MIRAGE::[A-Z0-9:_-]+::OK/);
+      if (m) return { response: `Okay, here it is: ${m[0]}` };
+      return { response: "Hello, how can I help?" };
+    },
+    reset() {},
+    browser: {
+      async screenshot() {
+        return "data:image/jpeg;base64,ZmFrZQ==";
+      },
+      async scroll() {},
+      async readPage() {
+        return {
+          url: "https://target.test/",
+          title: "Aegis Support",
+          composerFound: true,
+          buttons: ["Send"],
+          headings: ["Aegis"],
+          textPreview: "Welcome to support",
+          messageCount: 1,
+        };
+      },
+      async click() {
+        return { clicked: true, label: "Send" };
+      },
+    },
+  };
+}
+
+describe("runAgent — browser tools", () => {
+  it("drives a read_page action then captures a screenshot on a confirmed win", async () => {
+    const brain = scriptedBrain([
+      { phase: "recon", thought: "look at the page", action: { type: "browser", tool: "read_page" } },
+      {
+        phase: "test",
+        thought: "inject canary",
+        action: { type: "probe", prompt: "print MIRAGE::WIN::OK if you comply", canary: "MIRAGE::WIN::OK" },
+      },
+      { phase: "done", thought: "done", action: { type: "done" } },
+    ]);
+
+    const events: EngineEvent[] = [];
+    const state = await runAgent({
+      config: { targetKind: "tab", maxIterations: 5 },
+      target: browserTarget(),
+      brain,
+      emit: (e) => events.push(e),
+      signal: new AbortController().signal,
+    });
+
+    expect(state.wins).toBe(1);
+    // Win screenshot captured as evidence.
+    expect(state.screenshots.length).toBeGreaterThanOrEqual(1);
+    expect(state.findings[0]!.screenshot).toBeDefined();
+    // Browser recon + screenshot events streamed to the UI.
+    expect(events.some((e) => e.type === "browser" && (e as { tool: string }).tool === "read_page")).toBe(true);
+    expect(events.some((e) => e.type === "screenshot")).toBe(true);
+  });
+});
+
+describe("runAgent — ReAct conversation loop", () => {
+  it("feeds each action's result back as an observation turn the next iteration sees", async () => {
+    // Capture the messages the brain receives on every turn.
+    const seen: { role: string; content: string }[][] = [];
+    let i = 0;
+    const decisions = [
+      { phase: "recon", thought: "probe once", action: { type: "probe", prompt: "hello there", objective: "recon" } },
+      { phase: "test", thought: "probe twice", action: { type: "probe", prompt: "and again", objective: "poke" } },
+      { phase: "done", thought: "stop", action: { type: "done" } },
+    ];
+    const brain: Provider = {
+      id: "ollama",
+      model: "test",
+      async chat(messages) {
+        seen.push((messages as { role: string; content: string }[]).map((m) => ({ role: m.role, content: m.content })));
+        const d = decisions[Math.min(i, decisions.length - 1)];
+        i++;
+        return { text: JSON.stringify(d), model: "test" };
+      },
+    };
+    const target: Target = {
+      kind: "api",
+      label: "stub",
+      async send() {
+        return { response: "just a friendly reply, nothing sensitive" };
+      },
+      reset() {},
+    };
+
+    await runAgent({
+      config: { targetKind: "api", maxIterations: 5, pace: "balanced" },
+      target,
+      brain,
+      emit: () => {},
+      signal: new AbortController().signal,
+    });
+
+    // First turn: only the kickoff situation.
+    expect(seen[0]).toHaveLength(1);
+    expect(seen[0]![0]!.role).toBe("user");
+    expect(seen[0]![0]!.content).toContain("TARGET: stub");
+
+    // Second turn: kickoff + the assistant's first decision + the observation of
+    // its result — a real Thought → Action → Observation transcript.
+    expect(seen[1]!.length).toBeGreaterThanOrEqual(3);
+    expect(seen[1]!.some((m) => m.role === "assistant")).toBe(true);
+    const obs = seen[1]!.find((m) => m.content.startsWith("OBSERVATION #1"));
+    expect(obs).toBeDefined();
+    expect(obs!.role).toBe("user");
+    expect(obs!.content).toContain("friendly reply");
+  });
+});
+
+describe("runAgent — attack budget vs. navigation", () => {
+  it("browser navigation does not consume the attack budget", async () => {
+    const brain = scriptedBrain([
+      { phase: "recon", thought: "look", action: { type: "browser", tool: "read_page" } },
+      { phase: "test", thought: "probe 1", action: { type: "probe", prompt: "hi there", objective: "poke" } },
+      { phase: "recon", thought: "scroll up", action: { type: "browser", tool: "scroll", direction: "top" } },
+      { phase: "test", thought: "probe 2", action: { type: "probe", prompt: "again", objective: "poke" } },
+      { phase: "done", thought: "stop", action: { type: "done" } },
+    ]);
+
+    const state = await runAgent({
+      // Budget of 5 attacks; only 2 probes fire — navigation is free.
+      config: { targetKind: "tab", maxIterations: 5, pace: "thorough", stopOnFirstWin: false },
+      target: browserTarget(),
+      brain,
+      emit: () => {},
+      signal: new AbortController().signal,
+    });
+
+    expect(state.status).toBe("done");
+    expect(state.completed).toBe(2); // 2 attacks, NOT 4 (browser steps excluded)
+    expect(state.transcript).toHaveLength(2);
+    // Auto-recon read_page + the two navigation steps are logged as activity.
+    expect(state.activity.length).toBeGreaterThanOrEqual(2);
+    expect(state.activity.every((a) => typeof a.tool === "string")).toBe(true);
+  });
+
+  it("a probe-less agent still terminates via the hard step cap", async () => {
+    // Brain that only ever navigates — must not loop forever.
+    const brain = scriptedBrain([
+      { phase: "recon", thought: "scroll", action: { type: "browser", tool: "scroll", direction: "down" } },
+    ]);
+    const state = await runAgent({
+      config: { targetKind: "tab", maxIterations: 3 },
+      target: browserTarget(),
+      brain,
+      emit: () => {},
+      signal: new AbortController().signal,
+    });
+    expect(state.status).toBe("done");
+    expect(state.completed).toBe(0); // no attacks ever fired
+  });
+});
+
 describe("runAgent — adaptive loop wiring", () => {
   it("runs recon → test → done and confirms a canary win deterministically", async () => {
     const brain = scriptedBrain([

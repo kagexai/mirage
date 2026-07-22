@@ -47,10 +47,13 @@ export function toJsonReport(state: RunState): string {
         config: state.config,
         startedAt: state.startedAt,
         finishedAt: state.finishedAt,
-        iterations: state.completed,
+        attacks: state.completed,
         error: state.error,
       },
       summary: summarise(state),
+      screenshotCount: state.screenshots?.length ?? 0,
+      // Recon / navigation steps (read_page, scroll, click) — not attacks.
+      activity: state.activity ?? [],
       // Full attack/response log — every probe, not only confirmed wins.
       transcript: (state.transcript ?? []).map((p) => ({
         iteration: p.iteration,
@@ -65,8 +68,11 @@ export function toJsonReport(state: RunState): string {
         output: p.response,
         sideEffects: p.sideEffects,
       })),
-      findings: state.findings.map((f) => ({
+      // Drop the base64 screenshot from JSON (keeps the file small) — flag it
+      // instead; the visual evidence lives in the HTML report.
+      findings: state.findings.map(({ screenshot, ...f }) => ({
         ...f,
+        hasScreenshot: !!screenshot,
         steps: f.steps.map((s) => ({
           iteration: s.iteration,
           objective: s.objective,

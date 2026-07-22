@@ -2,6 +2,25 @@
 
 All notable changes to Mirage are documented in this file.
 
+## [0.3.0.0] - 2026-07-20
+
+### Added
+- **Proper ReAct agentic loop**: the attacker's own decisions and the harness's `OBSERVATION` turns accumulate as a real Thought → Action → Observation conversation instead of a flat memory blob re-rendered each turn
+- **Browser tools** (`read_page` / `scroll` / `click` / `screenshot`) so the agent can drive live chat UIs, plus auto-screenshot evidence captured on confirmed wins
+- **Auto-recon**: on a tab target Mirage reads the page once with no LLM call and seeds it into the agent, so the run opens by attacking instead of looking around
+- Speaker-aware reply extraction (`src/targets/reply.ts`) that parses `SPEAKER:`-prefixed, multi-agent chat pages
+- Reworked HTML report: verdict headline, attacks/confirmed/duration stats, severity chips, findings-first layout, and a separate recon/navigation timeline
+
+### Changed
+- **Budget counts attacks, not navigation** — `read_page`/`scroll`/`click`/`screenshot` are free recon (capped by a streak + hard step limit), so a run spends its budget on real probes
+- Progress and reports read in **attacks** (not "iterations"); recon steps show as un-numbered activity
+- Conversation is windowed to a stable, prompt-cacheable prefix sized from the pace profile
+- JSON report renames `iterations` → `attacks` and adds a recon `activity` array
+
+### Fixed
+- Reply capture returned a bare speaker label (e.g. `USER@ECORP:`) instead of the agent's actual response on multi-agent CTF pages — now rejected and parsed correctly
+- Attack counter lagged the transcript when a run was stopped mid-probe (during the goal-judge)
+
 ## [0.2.1.0] - 2026-07-17
 
 ### Fixed

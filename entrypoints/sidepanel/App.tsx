@@ -10,7 +10,7 @@ import { createProvider } from "@/src/providers";
 import { runAgent } from "@/src/engine/agent";
 import { createApiTarget } from "@/src/targets/api";
 import { createTabTarget } from "@/src/targets/tab";
-import type { AgentPhase, EngineEvent, Finding, ProbeLog, RunState } from "@/src/engine/run";
+import type { AgentPhase, Capture, EngineEvent, Finding, ProbeLog, RunState } from "@/src/engine/run";
 import { toJsonReport } from "@/src/report/json";
 import { toHtmlReport } from "@/src/report/html";
 import { generateNarrativeReport, narrativeToHtml } from "@/src/report/narrative";
@@ -20,6 +20,8 @@ type Status = "idle" | "running" | "done" | "stopped" | "error";
 type View = "run" | "settings";
 type FeedItem =
   | { kind: "agent"; iteration: number; phase: AgentPhase; thought: string }
+  | { kind: "browser"; iteration: number; tool: string; detail: string }
+  | { kind: "shot"; iteration: number; caption: string; dataUrl: string }
   | { kind: "probe"; probe: ProbeLog }
   | { kind: "finding"; finding: Finding };
 
@@ -54,6 +56,7 @@ export function App() {
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [findings, setFindings] = useState<Finding[]>([]);
   const [transcript, setTranscript] = useState<ProbeLog[]>([]);
+  const [screenshots, setScreenshots] = useState<Capture[]>([]);
   const [progress, setProgress] = useState({ completed: 0, total: 0, wins: 0 });
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<{ open: boolean; loading: boolean; md: string; error: string | null }>({
@@ -96,6 +99,7 @@ export function App() {
     setFeed([]);
     setFindings([]);
     setTranscript([]);
+    setScreenshots([]);
     setError(null);
     setReport({ open: false, loading: false, md: "", error: null });
     setProgress({ completed: 0, total: settings.run.maxIterations, wins: 0 });
@@ -176,6 +180,19 @@ export function App() {
         setTranscript((prev) => [...prev, event.probe]);
         setFeed((prev) => [{ kind: "probe", probe: event.probe }, ...prev]);
         break;
+      case "browser":
+        setFeed((prev) => [
+          { kind: "browser", iteration: event.iteration, tool: event.tool, detail: event.detail },
+          ...prev,
+        ]);
+        break;
+      case "screenshot":
+        setScreenshots((prev) => [...prev, { iteration: event.iteration, caption: event.caption, dataUrl: event.dataUrl }]);
+        setFeed((prev) => [
+          { kind: "shot", iteration: event.iteration, caption: event.caption, dataUrl: event.dataUrl },
+          ...prev,
+        ]);
+        break;
       case "finding":
         setFindings((prev) => [event.finding, ...prev]);
         setFeed((prev) => [{ kind: "finding", finding: event.finding }, ...prev]);
@@ -217,6 +234,9 @@ export function App() {
           runStateRef.current.transcript?.length > 0
             ? runStateRef.current.transcript
             : transcript,
+        screenshots: runStateRef.current.screenshots?.length
+          ? runStateRef.current.screenshots
+          : screenshots,
       };
     }
     return {
@@ -227,6 +247,11 @@ export function App() {
       finishedAt: Date.now(),
       findings: [...findings].reverse(),
       transcript,
+      screenshots,
+      activity: feed
+        .filter((f): f is Extract<FeedItem, { kind: "browser" }> => f.kind === "browser")
+        .map((f) => ({ tool: f.tool, detail: f.detail }))
+        .reverse(),
       total: progress.total,
       completed: progress.completed,
       wins: progress.wins,
@@ -348,7 +373,7 @@ export function App() {
                 </select>
               </div>
               <div className="field">
-                <label>Max iterations</label>
+                <label>Max attacks</label>
                 <input
                   type="number"
                   min={1}
@@ -477,7 +502,7 @@ export function App() {
               </div>
               <div className="stats">
                 <span>
-                  <b>{progress.completed}</b>/{progress.total} iterations
+                  <b>{progress.completed}</b>/{progress.total} attacks
                 </span>
                 <span className="win">
                   <b>{progress.wins}</b> confirmed
@@ -490,15 +515,27 @@ export function App() {
           {error && <div className="err">{error}</div>}
 
           {/* Live feed — probes include full input/output for export */}
-          {feed.map((item, i) =>
-            item.kind === "finding" ? (
-              <FindingCard key={item.finding.id} finding={item.finding} />
-            ) : item.kind === "probe" ? (
-              <ProbeCard key={`p-${item.probe.iteration}-${i}`} probe={item.probe} />
-            ) : (
+          {feed.map((item, i) => {
+            if (item.kind === "finding") return <FindingCard key={item.finding.id} finding={item.finding} />;
+            if (item.kind === "probe")
+              return <ProbeCard key={`p-${item.probe.iteration}-${i}`} probe={item.probe} />;
+            if (item.kind === "shot")
+              return (
+                <ShotCard
+                  key={`s-${i}`}
+                  iteration={item.iteration}
+                  caption={item.caption}
+                  dataUrl={item.dataUrl}
+                />
+              );
+            if (item.kind === "browser")
+              return (
+                <BrowserLine key={`b-${i}`} iteration={item.iteration} tool={item.tool} detail={item.detail} />
+              );
+            return (
               <AgentLine key={`a-${i}`} iteration={item.iteration} phase={item.phase} thought={item.thought} />
-            ),
-          )}
+            );
+          })}
 
           <LinksFooter />
         </>
@@ -637,13 +674,37 @@ function ReportModal(props: {
   );
 }
 
+function BrowserLine(props: { iteration: number; tool: string; detail: string }) {
+  return (
+    <div className="agentline">
+      <span className="phase phase-browser">recon</span>
+      <span className="muted">
+        <span className="mono">{props.tool}</span> {props.detail}
+      </span>
+    </div>
+  );
+}
+
+function ShotCard(props: { iteration: number; caption: string; dataUrl: string }) {
+  return (
+    <div className="finding shot-card">
+      <div className="tags">
+        <span className="tag">screenshot</span>
+        <span className="tag">iter {props.iteration}</span>
+      </div>
+      <div className="reason muted">{props.caption}</div>
+      <a href={props.dataUrl} target="_blank" rel="noopener noreferrer">
+        <img className="shot" src={props.dataUrl} alt="target screenshot" />
+      </a>
+    </div>
+  );
+}
+
 function AgentLine(props: { iteration: number; phase: AgentPhase; thought: string }) {
   return (
     <div className="agentline">
       <span className={`phase phase-${props.phase}`}>{props.phase}</span>
-      <span className="muted">
-        <span className="mono">#{props.iteration}</span> {props.thought}
-      </span>
+      <span className="muted">{props.thought}</span>
     </div>
   );
 }
@@ -738,6 +799,11 @@ function FindingCard({ finding: f }: { finding: Finding }) {
       </div>
       <div className="name">{f.objective}</div>
       <div className="reason">{f.reason}</div>
+      {f.screenshot && (
+        <a href={f.screenshot} target="_blank" rel="noopener noreferrer">
+          <img className="shot" src={f.screenshot} alt="evidence screenshot" />
+        </a>
+      )}
       {f.steps.length > 0 && (
         <details>
           <summary className="muted" style={{ fontSize: 11, cursor: "pointer", marginTop: 4 }}>

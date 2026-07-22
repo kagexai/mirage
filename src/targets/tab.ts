@@ -1,4 +1,4 @@
-import type { Target, TargetResponse } from "./types";
+import type { BrowserTools, PageSnapshot, Target, TargetResponse } from "./types";
 
 // Messages exchanged with the content script (entrypoints/content.ts).
 export interface TabSendMessage {
@@ -22,17 +22,35 @@ export interface TabResetMessage {
 export interface TabPingMessage {
   type: "mirage:ping";
 }
+export interface TabScrollMessage {
+  type: "mirage:scroll";
+  direction: "up" | "down" | "top" | "bottom";
+}
+export interface TabReadMessage {
+  type: "mirage:read";
+}
+export interface TabClickMessage {
+  type: "mirage:click";
+  selector?: string;
+  text?: string;
+}
 export type TabMessage =
   | TabSendMessage
   | TabPrepareMessage
   | TabAwaitMessage
   | TabResetMessage
-  | TabPingMessage;
+  | TabPingMessage
+  | TabScrollMessage
+  | TabReadMessage
+  | TabClickMessage;
 export interface TabReply {
   ok: boolean;
   response?: string;
   sideEffects?: string[];
   error?: string;
+  snapshot?: PageSnapshot;
+  clicked?: boolean;
+  clickedLabel?: string;
   /** From mirage:prepare */
   beforeAssistant?: string[];
   beforeBlob?: string;
@@ -108,6 +126,43 @@ export function createTabTarget(tabId: number): Target {
       void ensureReady()
         .then(() => sendToTab(tabId, { type: "mirage:reset" }))
         .catch(() => undefined);
+    },
+    browser: makeBrowserTools(tabId, ensureReady),
+  };
+}
+
+// Live-page controls the agent can drive. Screenshot is captured from this
+// (extension-page) context via chrome.tabs.captureVisibleTab; scroll/read/click
+// go through the injected content script.
+function makeBrowserTools(tabId: number, ensureReady: () => Promise<void>): BrowserTools {
+  return {
+    async screenshot(): Promise<string> {
+      const tab = await chrome.tabs.get(tabId);
+      // captureVisibleTab grabs the active tab of the window; jpeg keeps the
+      // data URL small enough to embed in findings/reports.
+      return chrome.tabs.captureVisibleTab(tab.windowId, { format: "jpeg", quality: 55 });
+    },
+    async scroll(direction): Promise<void> {
+      await ensureReady();
+      await sendToTab(tabId, { type: "mirage:scroll", direction });
+    },
+    async readPage(): Promise<PageSnapshot> {
+      await ensureReady();
+      const reply = await sendToTab(tabId, { type: "mirage:read" });
+      if (!reply.ok || !reply.snapshot) {
+        throw new Error(reply.error || "could not read the page");
+      }
+      return reply.snapshot;
+    },
+    async click(target): Promise<{ clicked: boolean; label?: string }> {
+      await ensureReady();
+      const reply = await sendToTab(tabId, {
+        type: "mirage:click",
+        selector: target.selector,
+        text: target.text,
+      });
+      if (!reply.ok) throw new Error(reply.error || "click failed");
+      return { clicked: !!reply.clicked, label: reply.clickedLabel };
     },
   };
 }

@@ -354,6 +354,22 @@ details pre {
   color: var(--success);
   border-color: color-mix(in oklab, var(--success) 40%, transparent);
 }
+.phase-browser {
+  color: var(--teal);
+  border-color: color-mix(in oklab, var(--teal) 40%, transparent);
+}
+
+/* Screenshot evidence */
+.shot {
+  display: block;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 8px;
+}
+.shot-card {
+  border-left-color: var(--teal);
+}
 
 /* Intro / about */
 .intro p {
