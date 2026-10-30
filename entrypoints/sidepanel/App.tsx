@@ -35,6 +35,7 @@ const SOCIALS = [
   { name: "X", href: "https://x.com/kagex_ai" },
   { name: "Instagram", href: "https://www.instagram.com/kagex.ai" },
   { name: "LinkedIn", href: "https://linkedin.com/company/kagexai" },
+  { name: "YouTube", href: "https://www.youtube.com/@KageX-ai" },
   { name: "kagex.ai", href: "https://kagex.ai" },
 ];
 
